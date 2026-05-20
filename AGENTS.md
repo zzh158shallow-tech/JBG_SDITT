@@ -1,5 +1,13 @@
 # Project Memory
 
+## Python Code Location
+
+- All existing and future Python code for this project should live under
+  `python/`.
+- If new Python scripts, modules, packages, or generated `.py` files are
+  created, place them in `python/` unless the user explicitly asks for a
+  different location.
+
 ## GitHub Push Target
 
 - This project is a private GitHub repository.
@@ -34,4 +42,3 @@ Known ignored examples include:
 - `SDITT-RW-FT-250728/Mat_FT_CN18_T4.mat`
 - `SDITT-RW-FT-250728/Pre_CRH380A_009_Face_V350_zgygPf2_*.mat`
 - `SDITT-RW-FT-250728/CRH380A_009_Face_V350_zgygPf2.mat`
-

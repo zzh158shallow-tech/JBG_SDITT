@@ -12,6 +12,14 @@ The MATLAB code is mainly under:
 
 `SDITT-RW-FT-250728/`
 
+All Python code for this project should live under:
+
+`python/`
+
+Use `python/` for existing and future `.py` files, including generated scripts,
+modules, packages, and Python migration work, unless the user explicitly asks
+for a different location.
+
 The current main script appears to be:
 
 `SDITT-RW-FT-250728/SDITT_CR400_NoStrTIrr_250728_Face.m`
@@ -218,4 +226,3 @@ The thesis chapter most relevant to code understanding is Chapter 2, especially 
 - 2.5 normal contact model
 - 2.6 tangential contact and creepage model
 - 2.7 vehicle-turnout coupled integration algorithm
-
