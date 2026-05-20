@@ -1,0 +1,14 @@
+.DS_Store
+
+# Large generated/cache files that should not go to GitHub by default.
+SDITT-RW-FT-250728/Mat_FT_S8b.mat
+SDITT-RW-FT-250728/Mat_FT_CN18_T4.mat
+SDITT-RW-FT-250728/Pre_CRH380A_009_Face_V350_zgygPf2_*.mat
+SDITT-RW-FT-250728/CRH380A_009_Face_V350_zgygPf2.mat
+
+# Local reference PDFs can be stored separately or via Git LFS if needed.
+*.pdf
+
+# MATLAB local/editor artifacts.
+*.asv
+*.autosave

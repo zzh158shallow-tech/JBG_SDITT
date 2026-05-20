@@ -1,0 +1,11 @@
+ 104.547 CN18_zgyg_54.547m.txt
+ 104.577 CN18_zgyg_54.577m.txt
+ 104.607 CN18_zgyg_54.607m.txt
+ 104.637 CN18_zgyg_54.637m.txt
+ 104.667 CN18_zgyg_54.667m.txt
+ 104.697 CN18_zgyg_54.697m.txt
+ 104.727 CN18_zgyg_54.727m.txt
+ 104.757 CN18_zgyg_54.757m.txt
+ 104.787 CN18_zgyg_54.787m.txt
+ 104.817 CN18_zgyg_54.817m.txt
+ 104.847 CN18_zgyg_54.847m.txt
