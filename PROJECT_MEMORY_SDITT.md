@@ -24,6 +24,23 @@ The current main script appears to be:
 
 `SDITT-RW-FT-250728/SDITT_CR400_NoStrTIrr_250728_Face.m`
 
+## Key Data Files
+
+- `SDITT-RW-FT-250728/Mat_FT_S8b.mat`
+  - MATLAB v5 `.mat` file, about 984 MB.
+  - Created on July 31, 2023 by the original MATLAB workflow.
+  - This is the flexible turnout modal/input data file used by the FT-Modal
+    track model, not a Python source file and not a small derived result.
+  - Top-level variables observed from the Python reader:
+    `DOF_Node`, `ModeFreq`, `ModeShape`, `ModeShape_Mapping`, `N_Node`,
+    `Pos_Node`, and `Type_SpaceIron`.
+  - It stores node/DOF mapping, node positions/counts, modal frequencies,
+    mode shapes, mode-shape mapping, and spacer-iron type data needed by
+    flexible turnout dynamics.
+  - Because it is large and project-private runtime/model data, it is ignored
+    by Git and should not be committed unless the user explicitly chooses a
+    storage strategy such as Git LFS or external object storage.
+
 ## Core Model Understanding
 
 SDITT is not a simple vehicle-track coupling model. It is a tightly coupled time-domain simulation made of these main modules:
@@ -182,6 +199,55 @@ The most difficult migration target is `Multi_Con_250812.m`, because it currentl
 - output struct packing.
 
 This file should be decomposed before translating.
+
+### Vehicle Parameter And Matrix Port
+
+Python now includes the CRH380A rigid-wheelset vehicle parameter/matrix path
+corresponding to:
+
+- MATLAB parameters: `SDITT-RW-FT-250728/Par_Vehicle_CRH380A_v6.m`
+- MATLAB matrices: `SDITT-RW-FT-250728/Matrix_Vehicle_RW_230409.m`
+- Python parameter reader: `python/sditt/vehicle/parameters.py`
+- Python matrix builder: `python/sditt/vehicle/matrices.py`
+
+Use:
+
+```python
+from sditt.config import ProjectPaths
+from sditt.vehicle import build_vehicle_matrices_rw_230409, load_vehicle_parameters
+
+paths = ProjectPaths.from_repo_root()
+vehicle = load_vehicle_parameters(paths.default_vehicle_parameters)
+matrices = build_vehicle_matrices_rw_230409(vehicle)
+
+M_vehicle = matrices.M_vehicle
+K_vehicle = matrices.K_vehicle
+C_vehicle = matrices.C_vehicle
+```
+
+The Python builder keeps the original MATLAB 1-based DOF assembly formulae at
+the call sites and translates indices only in small helper functions. This is
+intentional: it makes later MATLAB/Python diffing easier and reduces migration
+indexing mistakes.
+
+Current output shape is `51 x 51` for `M_vehicle`, `K_vehicle`, and
+`C_vehicle`. `VehicleMatrices` also exposes MATLAB-compatible aliases:
+`Mlc`, `Klc`, `Clc`, and `Clc_0`.
+
+The parameter reader now applies the MATLAB lateral-stop table post-processing
+for `K_STy_Table` (`mirror + sortrows`) and should report no unsupported
+statements for `Par_Vehicle_CRH380A_v6.m`.
+
+Current smoke verification, using the bundled Codex Python runtime with numpy:
+
+- `M_vehicle.sum() = 3470950.4000001596`
+- `K_vehicle.sum() = 387662209.445`
+- `C_vehicle.sum() = 49006103.89`
+- `K_vehicle` and `C_vehicle` are symmetric.
+
+Full `pytest` was not run in the local system Python because `pytest` was not
+installed in the available runtime. The targeted smoke/assert script and
+`py_compile` passed.
 
 ## Current Defaults Observed
 

@@ -12,3 +12,8 @@ SDITT-RW-FT-250728/CRH380A_009_Face_V350_zgygPf2.mat
 # MATLAB local/editor artifacts.
 *.asv
 *.autosave
+
+# Python local/cache artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/

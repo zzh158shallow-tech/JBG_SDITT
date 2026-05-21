@@ -39,6 +39,11 @@ such as Git LFS, private object storage, or an external transfer method.
 Known ignored examples include:
 
 - `SDITT-RW-FT-250728/Mat_FT_S8b.mat`
+  - Flexible turnout modal/input data for the FT-Modal track model.
+  - MATLAB v5 `.mat`, about 984 MB, with top-level variables such as
+    `DOF_Node`, `ModeFreq`, `ModeShape`, `ModeShape_Mapping`, `N_Node`,
+    `Pos_Node`, and `Type_SpaceIron`.
+  - Treat as large private model/runtime data, not source code.
 - `SDITT-RW-FT-250728/Mat_FT_CN18_T4.mat`
 - `SDITT-RW-FT-250728/Pre_CRH380A_009_Face_V350_zgygPf2_*.mat`
 - `SDITT-RW-FT-250728/CRH380A_009_Face_V350_zgygPf2.mat`
