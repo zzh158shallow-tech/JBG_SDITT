@@ -26,7 +26,8 @@ and flexible turnout modal matrix skeletons from:
 - `Matrix_Vehicle_RW_230409.m`
 - `Matrix_Modal_FT_230313.m`
 
-It does not yet perform wheel-rail contact, time integration, or full coupled
+It now includes the first linear time-integration loop without wheel-rail
+contact. It does not yet perform wheel-rail contact or full coupled
 vehicle-track simulation.
 
 Useful smoke check for the raw MATLAB/text/profile data layer:
@@ -78,6 +79,23 @@ This follows the main-script ordering
 `[track DOFs, flexible wheel DOFs, rigid vehicle DOFs]`. For the current RW
 vehicle route, `nm_fw = 0`, so `Mxt/Kxt/Cxt` are the track block followed
 directly by the 51-DOF vehicle block.
+
+Run the first no-contact forced-response loop:
+
+```python
+from sditt.simulation import run_default_no_contact_smoke
+
+result = run_default_no_contact_smoke(cut_freq=50.0, dt=1e-4, n_steps=100)
+time = result.history.time
+displacement = result.history.displacement
+velocity = result.history.velocity
+acceleration = result.history.acceleration
+force = result.force
+```
+
+This uses a simple prescribed harmonic force and advances the uncoupled
+vehicle-track system with the Park/Newmark integrator. It does not compute
+wheel-rail contact forces.
 
 Install the package in editable mode from this directory when using a fresh
 Python environment:
