@@ -5,7 +5,17 @@ import numpy as np
 from sditt.config import ProjectPaths
 from sditt.io import inspect_raw_inputs, load_sditt_raw_inputs
 from sditt.io.text import load_numeric_text
-from sditt.profiles import discover_profile_files, load_profile_file
+from sditt.profiles import (
+    build_track_profiles,
+    build_wheel_profiles,
+    contact_tables,
+    create_bezier_profile_data,
+    discover_profile_files,
+    interpolate_rail_profiles,
+    load_profile_file,
+    offset_profile_to_track,
+    read_mileage_profile_file,
+)
 from sditt.simulation import assemble_system_matrices, build_default_modal_rw_system_matrices
 from sditt.track import (
     build_flexible_turnout_modal_matrices,
@@ -176,6 +186,84 @@ def test_load_profile_text_file() -> None:
     profile = load_profile_file(files[0])
     assert profile.path.exists()
     assert profile.points.ndim == 2
+
+
+def test_build_wheel_profiles_from_matlab_inputs() -> None:
+    paths = ProjectPaths.from_repo_root()
+    wheel = build_wheel_profiles(paths.wheel_profile_dir, r0=0.430)
+
+    assert wheel.right.shape[1] == 2
+    assert wheel.left.shape == wheel.right.shape
+    assert wheel.contact_angle_right.shape[1] == 2
+    assert wheel.contact_angle_left.shape == wheel.contact_angle_right.shape
+    assert wheel.radius_right.shape == wheel.right.shape
+    assert np.allclose(wheel.left[:, 0], np.sort(-wheel.right[:, 0]))
+    assert np.isclose(np.max(wheel.right[:, 1]), 0.430 + 0.0280248, atol=1e-7)
+
+
+def test_contact_lookup_tables_match_matlab_shapes() -> None:
+    tables = contact_tables()
+
+    assert tables.bgmn.shape == (44, 3)
+    assert tables.bgc1.shape == (10, 5)
+    assert tables.bgc2.shape == (10, 5)
+    assert np.isclose(tables.bgmn[-1, 0], np.pi / 2)
+    assert np.isclose(tables.bgc2[0, 0], 0.1)
+
+
+def test_read_mileage_and_interpolate_rail_profiles() -> None:
+    paths = ProjectPaths.from_repo_root()
+    profile_dir = paths.profile_dir / "07(009)-zjg-20200418"
+    mileage_entries = read_mileage_profile_file(
+        profile_dir / "Mileage_prr.txt",
+        profile_base_dir=profile_dir,
+    )
+
+    profiles = interpolate_rail_profiles(
+        mileage_entries[10].mileage + 0.03,
+        [0.0, 1.0, 2.0, 3.0],
+        mileage_entries,
+        same_front_profile=True,
+        same_rear_profile=False,
+        num_interp=128,
+    )
+    ff = profiles.by_station["FF"]
+
+    assert len(mileage_entries) > 20
+    assert ff.profile.shape == (128, 2)
+    assert ff.front_profile.shape[1] == 2
+    assert ff.rear_profile.shape[1] == 2
+    assert ff.radius.shape == (128, 2)
+    assert ff.profile_num is not None
+
+
+def test_bezier_profile_data_and_track_coordinate_offsets() -> None:
+    paths = ProjectPaths.from_repo_root()
+    profile_dir = paths.profile_dir / "07(009)-zjg-20200418"
+    mileage_entries = read_mileage_profile_file(
+        profile_dir / "Mileage_prr.txt",
+        profile_base_dir=profile_dir,
+    )[:5]
+    divisions = np.array([[mileage_entries[0].mileage, mileage_entries[-1].mileage]], dtype=float)
+    bezier = create_bezier_profile_data(mileage_entries, divisions, num_interp=64)
+
+    rail = interpolate_rail_profiles(
+        mileage_entries[2].mileage,
+        {"FF": 0.0, "FR": 0.0, "RF": 0.0, "RR": 0.0},
+        mileage_entries,
+        same_front_profile=True,
+        same_rear_profile=True,
+        bezier=bezier,
+        num_interp=64,
+    ).by_station["FF"]
+    offset = offset_profile_to_track(rail, wheel_side="R", ori_prr=0.0, dis_rail_y=0.01, dis_rail_z=0.02)
+    track = build_track_profiles({"R1": offset}, left_dummy_rails=(), right_dummy_rails=("R1",))
+
+    assert bezier.y.shape == (64, 5)
+    assert rail.profile.shape == (64, 2)
+    assert np.allclose(offset.profile[:, 0], rail.profile[:, 0] + 1.435 / 2 + 0.01)
+    assert np.allclose(offset.profile[:, 1], rail.profile[:, 1] + 0.62)
+    assert np.array_equal(track.profile["R"], offset.profile)
 
 
 def test_load_mileage_text_file() -> None:

@@ -1,0 +1,454 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class WheelPose2D:
+    """Rigid wheel pose used by the single wheel/rail contact geometry."""
+
+    lateral: float = 0.0
+    vertical: float = 0.0
+    roll: float = 0.0
+    yaw: float = 0.0
+
+
+@dataclass(frozen=True)
+class WheelTrace:
+    """Wheel profile points transformed into the track coordinate system."""
+
+    wheel_lateral: np.ndarray
+    track_points: np.ndarray
+    contact_angles: np.ndarray
+
+
+@dataclass(frozen=True)
+class SinglePointContact:
+    """One Hertz-style normal contact geometry result."""
+
+    has_contact: bool
+    rail_point: np.ndarray
+    wheel_point: np.ndarray
+    wheel_profile_lateral: float
+    vertical_gap: float
+    vertical_penetration: float
+    normal_penetration: float
+    contact_angle: float
+
+
+@dataclass(frozen=True)
+class ContactPatch:
+    """One positive-penetration contact patch before and after correction."""
+
+    peak_index: int
+    start_index: int
+    end_index: int
+    peak_wheel_point: np.ndarray
+    peak_rail_point: np.ndarray
+    corrected_wheel_point: np.ndarray
+    corrected_rail_point: np.ndarray
+    wheel_profile_lateral: float
+    peak_vertical_penetration: float
+    corrected_vertical_penetration: float
+    corrected_normal_penetration: float
+    contact_angle: float
+
+
+@dataclass(frozen=True)
+class BoundaryExtrema:
+    """Positive penetration intervals and extrema from ``Extreme_Boundary.m``."""
+
+    extrema: np.ndarray
+    positive_extrema: np.ndarray
+    starts: np.ndarray
+    ends: np.ndarray
+
+
+@dataclass(frozen=True)
+class MultiPointContactGeometry:
+    """Candidate contact patches found from one wheel profile and one rail profile."""
+
+    has_contact: bool
+    elastic_penetration: np.ndarray
+    wheel_interp: np.ndarray
+    rail_interp: np.ndarray
+    contact_angles: np.ndarray
+    wheel_profile_lateral: np.ndarray
+    boundaries: BoundaryExtrema
+    patches: tuple[ContactPatch, ...]
+
+
+def trace_wheel_profile(
+    wheel_profile: np.ndarray,
+    contact_angle_table: np.ndarray,
+    pose: WheelPose2D | None = None,
+) -> WheelTrace:
+    """Transform a wheel profile into the track cross-section.
+
+    This is the single-rigid-wheel subset of MATLAB ``TracePrinciple.m``. The
+    output columns are ``x, y, z`` in track coordinates; only ``y`` and ``z``
+    are needed for the current cross-section contact geometry.
+    """
+
+    pose = pose or WheelPose2D()
+    profile = _sort_points(wheel_profile)
+    angle_table = _sort_points(contact_angle_table)
+
+    x_profile = profile[:, 0]
+    rolling_radius = profile[:, 1]
+    contact_angles = np.interp(x_profile, angle_table[:, 0], angle_table[:, 1])
+
+    lx = -np.cos(pose.roll) * np.sin(pose.yaw)
+    ly = np.cos(pose.roll) * np.cos(pose.yaw)
+    lz = np.sin(pose.roll)
+    tan_angle = np.tan(contact_angles)
+    m_value = np.sqrt(np.maximum(0.0, 1.0 - lx**2 * (1.0 + tan_angle**2)))
+    denominator = 1.0 - lx**2
+
+    x_base = x_profile * lx
+    y_base = x_profile * ly + pose.lateral
+    z_base = x_profile * lz + pose.vertical
+
+    x_track = x_base + lx * rolling_radius * tan_angle
+    y_track = y_base - rolling_radius * (lx**2 * ly * tan_angle + lz * m_value) / denominator
+    z_track = z_base - rolling_radius * (lx**2 * lz * tan_angle - ly * m_value) / denominator
+    return WheelTrace(
+        wheel_lateral=x_profile,
+        track_points=np.column_stack((x_track, y_track, z_track)),
+        contact_angles=contact_angles,
+    )
+
+
+def single_point_contact_geometry(
+    wheel_profile: np.ndarray,
+    contact_angle_table: np.ndarray,
+    rail_profile: np.ndarray,
+    *,
+    pose: WheelPose2D | None = None,
+    min_overlap_margin: float = 0.0,
+) -> SinglePointContact:
+    """Compute the simplest single-point wheel/rail normal contact geometry.
+
+    The contact candidate is the wheel-trace point with the largest vertical
+    penetration against the interpolated rail profile. Positive penetration
+    means the transformed wheel profile lies below/into the rail profile in the
+    same vertical coordinate convention used by the MATLAB migration.
+    """
+
+    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose)
+    rail = _sort_points(rail_profile)
+    if trace.track_points.size == 0 or rail.size == 0:
+        return _empty_contact()
+
+    y_wheel = trace.track_points[:, 1]
+    lower = max(float(np.min(y_wheel)), float(np.min(rail[:, 0]))) + min_overlap_margin
+    upper = min(float(np.max(y_wheel)), float(np.max(rail[:, 0]))) - min_overlap_margin
+    if lower > upper:
+        return _empty_contact()
+
+    mask = (y_wheel >= lower) & (y_wheel <= upper)
+    if not np.any(mask):
+        return _empty_contact()
+
+    wheel_points = trace.track_points[mask]
+    wheel_lateral = trace.wheel_lateral[mask]
+    contact_angles = trace.contact_angles[mask]
+    rail_z = np.interp(wheel_points[:, 1], rail[:, 0], rail[:, 1])
+    vertical_gap = rail_z - wheel_points[:, 2]
+    index = int(np.argmin(vertical_gap))
+
+    gap = float(vertical_gap[index])
+    vertical_penetration = max(0.0, -gap)
+    contact_angle = float(contact_angles[index])
+    roll = 0.0 if pose is None else pose.roll
+    normal_penetration = vertical_penetration / max(np.cos(contact_angle + roll), np.finfo(float).eps)
+    rail_point = np.array([wheel_points[index, 1], rail_z[index]], dtype=float)
+    wheel_point = np.array([wheel_points[index, 1], wheel_points[index, 2]], dtype=float)
+    return SinglePointContact(
+        has_contact=vertical_penetration > 0.0,
+        rail_point=rail_point,
+        wheel_point=wheel_point,
+        wheel_profile_lateral=float(wheel_lateral[index]),
+        vertical_gap=gap,
+        vertical_penetration=vertical_penetration,
+        normal_penetration=float(normal_penetration),
+        contact_angle=contact_angle,
+    )
+
+
+def multi_point_contact_geometry(
+    wheel_profile: np.ndarray,
+    contact_angle_table: np.ndarray,
+    rail_profile: np.ndarray,
+    *,
+    pose: WheelPose2D | None = None,
+    penetration_offset: float = 0.0,
+    min_overlap_margin: float = 0.0,
+    correction_theta: float = 2e-5,
+) -> MultiPointContactGeometry:
+    """Find all single-rail contact candidates and apply quasi-elastic correction.
+
+    This reproduces the ``Multi_Con_250812.m`` contact-point finding subset:
+    trace wheel profile, interpolate rail height, build the elastic penetration
+    curve, find positive penetration intervals, then move each peak contact
+    point to the weighted quasi-elastic center of its interval.
+    """
+
+    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose)
+    wheel_interp, rail_interp, angles, wheel_lateral = _overlap_interpolants(
+        trace,
+        rail_profile,
+        min_overlap_margin=min_overlap_margin,
+    )
+    if wheel_interp.size == 0:
+        empty = np.empty((0, 2), dtype=float)
+        boundaries = extreme_boundary(empty)
+        return MultiPointContactGeometry(False, empty, wheel_interp, rail_interp, angles, wheel_lateral, boundaries, ())
+
+    elastic_penetration = np.column_stack((wheel_interp[:, 1], wheel_interp[:, 2] - rail_interp[:, 1] + penetration_offset))
+    boundaries = extreme_boundary(elastic_penetration, opt="max")
+    patches = quasi_elastic_correction(
+        elastic_penetration,
+        boundaries.positive_extrema,
+        boundaries.starts,
+        boundaries.ends,
+        wheel_interp,
+        rail_interp,
+        angles,
+        wheel_lateral,
+        roll=0.0 if pose is None else pose.roll,
+        theta=correction_theta,
+    )
+    return MultiPointContactGeometry(
+        has_contact=bool(patches),
+        elastic_penetration=elastic_penetration,
+        wheel_interp=wheel_interp,
+        rail_interp=rail_interp,
+        contact_angles=angles,
+        wheel_profile_lateral=wheel_lateral,
+        boundaries=boundaries,
+        patches=patches,
+    )
+
+
+def extreme_boundary(ver_dis: np.ndarray, opt: str = "max") -> BoundaryExtrema:
+    """Find extrema and positive intervals following MATLAB ``Extreme_Boundary.m``.
+
+    Returned indexes are zero-based Python sample indexes. Array columns are
+    ``index, y, value, first_derivative``.
+    """
+
+    data = _sort_points(ver_dis)
+    if data.shape[0] < 2:
+        empty = np.empty((0, 4), dtype=float)
+        return BoundaryExtrema(empty, empty, empty, empty)
+
+    derivative = np.gradient(data[:, 1], data[:, 0])
+    sign_change = ((derivative[:-1] < 0) & (derivative[1:] >= 0)) | (
+        (derivative[:-1] >= 0) & (derivative[1:] < 0)
+    )
+    extrema_mask = (data[:-1, 1] >= 0) & sign_change
+    extrema_indexes = np.flatnonzero(extrema_mask)
+    extrema = _boundary_rows(data, derivative, extrema_indexes)
+
+    start_indexes = np.flatnonzero((data[:-1, 1] < 0) & (data[1:, 1] >= 0)) + 1
+    end_indexes = np.flatnonzero((data[:-1, 1] >= 0) & (data[1:, 1] < 0))
+
+    if data[0, 1] >= 0:
+        start_indexes = np.concatenate(([0], start_indexes))
+    if data[-1, 1] >= 0:
+        end_indexes = np.concatenate((end_indexes, [data.shape[0] - 1]))
+
+    pair_count = min(start_indexes.size, end_indexes.size)
+    start_indexes = start_indexes[:pair_count]
+    end_indexes = end_indexes[:pair_count]
+    starts = _boundary_rows(data, derivative, start_indexes)
+    ends = _boundary_rows(data, derivative, end_indexes)
+
+    if pair_count == 0:
+        positive = np.empty((0, 4), dtype=float)
+    elif opt == "min":
+        min_mask = (data[:-1, 1] >= 0) & (derivative[:-1] < 0) & (derivative[1:] >= 0)
+        positive = _boundary_rows(data, derivative, np.flatnonzero(min_mask))
+    elif opt == "max":
+        peaks = []
+        for start, end in zip(start_indexes, end_indexes, strict=True):
+            if end < start:
+                continue
+            local = start + int(np.argmax(data[start : end + 1, 1]))
+            peaks.append(local)
+        positive = _boundary_rows(data, derivative, np.array(peaks, dtype=int))
+    else:
+        raise ValueError("opt must be 'max' or 'min'")
+    return BoundaryExtrema(extrema=extrema, positive_extrema=positive, starts=starts, ends=ends)
+
+
+def quasi_elastic_correction(
+    elastic_penetration: np.ndarray,
+    positive_peaks: np.ndarray,
+    positive_starts: np.ndarray,
+    positive_ends: np.ndarray,
+    wheel_interp: np.ndarray,
+    rail_interp: np.ndarray,
+    contact_angles: np.ndarray,
+    wheel_profile_lateral: np.ndarray | None = None,
+    *,
+    roll: float = 0.0,
+    theta: float = 2e-5,
+) -> tuple[ContactPatch, ...]:
+    """Apply MATLAB ``Quasi_Elastic_Correction.m`` to candidate patches."""
+
+    if positive_peaks.size == 0:
+        return ()
+
+    elastic = _sort_points(elastic_penetration)
+    wheel = _sort_points_by_column(wheel_interp, 1)
+    rail = _sort_points(rail_interp)
+    angles = np.asarray(contact_angles, dtype=float)
+    wheel_lateral = np.asarray(wheel_profile_lateral, dtype=float) if wheel_profile_lateral is not None else wheel[:, 1]
+    patches: list[ContactPatch] = []
+
+    for peak_row, start_row, end_row in zip(positive_peaks, positive_starts, positive_ends, strict=True):
+        peak_index = int(peak_row[0])
+        start = int(start_row[0])
+        end = int(end_row[0])
+        if end < start:
+            continue
+
+        peak_penetration = float(peak_row[2])
+        center_y = _weighted_patch_center(elastic, start, end, peak_penetration, theta)
+        corrected_penetration = float(np.interp(center_y, elastic[:, 0], elastic[:, 1]))
+        corrected_wheel = np.array(
+            [
+                np.interp(center_y, wheel[:, 1], wheel[:, 0]),
+                center_y,
+                np.interp(center_y, wheel[:, 1], wheel[:, 2]),
+            ],
+            dtype=float,
+        )
+        corrected_rail = np.array([center_y, np.interp(center_y, rail[:, 0], rail[:, 1])], dtype=float)
+        corrected_angle = float(np.interp(center_y, wheel[:, 1], angles))
+        normal_penetration = corrected_penetration / max(np.cos(corrected_angle + roll), np.finfo(float).eps)
+
+        peak_wheel = wheel[peak_index, :]
+        peak_rail = rail[peak_index, :]
+        patches.append(
+            ContactPatch(
+                peak_index=peak_index,
+                start_index=start,
+                end_index=end,
+                peak_wheel_point=peak_wheel.copy(),
+                peak_rail_point=peak_rail.copy(),
+                corrected_wheel_point=corrected_wheel,
+                corrected_rail_point=corrected_rail,
+                wheel_profile_lateral=float(np.interp(center_y, wheel[:, 1], wheel_lateral)),
+                peak_vertical_penetration=peak_penetration,
+                corrected_vertical_penetration=corrected_penetration,
+                corrected_normal_penetration=float(normal_penetration),
+                contact_angle=corrected_angle,
+            )
+        )
+    return tuple(patches)
+
+
+def _sort_points(points: np.ndarray) -> np.ndarray:
+    data = np.asarray(points, dtype=float)
+    if data.size == 0:
+        return data.reshape(0, 2)
+    return data[np.argsort(data[:, 0])]
+
+
+def _sort_points_by_column(points: np.ndarray, column: int) -> np.ndarray:
+    data = np.asarray(points, dtype=float)
+    if data.size == 0:
+        return data.reshape(0, 3)
+    return data[np.argsort(data[:, column])]
+
+
+def _overlap_interpolants(
+    trace: WheelTrace,
+    rail_profile: np.ndarray,
+    *,
+    min_overlap_margin: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rail = _sort_points(rail_profile)
+    if trace.track_points.size == 0 or rail.size == 0:
+        return (
+            np.empty((0, 3), dtype=float),
+            np.empty((0, 2), dtype=float),
+            np.empty((0,), dtype=float),
+            np.empty((0,), dtype=float),
+        )
+
+    y_wheel = trace.track_points[:, 1]
+    lower = max(float(np.min(y_wheel)), float(np.min(rail[:, 0]))) + min_overlap_margin
+    upper = min(float(np.max(y_wheel)), float(np.max(rail[:, 0]))) - min_overlap_margin
+    if lower > upper:
+        return (
+            np.empty((0, 3), dtype=float),
+            np.empty((0, 2), dtype=float),
+            np.empty((0,), dtype=float),
+            np.empty((0,), dtype=float),
+        )
+
+    mask = (y_wheel >= lower) & (y_wheel <= upper)
+    if not np.any(mask):
+        return (
+            np.empty((0, 3), dtype=float),
+            np.empty((0, 2), dtype=float),
+            np.empty((0,), dtype=float),
+            np.empty((0,), dtype=float),
+        )
+
+    sort_index = np.argsort(trace.track_points[mask, 1])
+    wheel = trace.track_points[mask][sort_index]
+    angles = trace.contact_angles[mask][sort_index]
+    wheel_lateral = trace.wheel_lateral[mask][sort_index]
+    rail_z = np.interp(wheel[:, 1], rail[:, 0], rail[:, 1])
+    rail_interp = np.column_stack((wheel[:, 1], rail_z))
+    return wheel, rail_interp, angles, wheel_lateral
+
+
+def _boundary_rows(data: np.ndarray, derivative: np.ndarray, indexes: np.ndarray) -> np.ndarray:
+    if indexes.size == 0:
+        return np.empty((0, 4), dtype=float)
+    return np.column_stack((indexes, data[indexes, 0], data[indexes, 1], derivative[indexes]))
+
+
+def _weighted_patch_center(
+    elastic: np.ndarray,
+    start: int,
+    end: int,
+    peak_penetration: float,
+    theta: float,
+) -> float:
+    y = elastic[start : end + 1, 0]
+    penetration = elastic[start : end + 1, 1]
+    if y.size == 1:
+        return float(y[0])
+    weights = np.exp((penetration - peak_penetration) / theta)
+    if end + 1 < elastic.shape[0]:
+        widths = np.diff(elastic[start : end + 2, 0])
+    else:
+        widths = np.gradient(y)
+    weighted_widths = weights * widths
+    denominator = float(np.sum(weighted_widths))
+    if denominator == 0.0:
+        return float(y[int(np.argmax(penetration))])
+    return float(np.sum(y * weighted_widths) / denominator)
+
+
+def _empty_contact() -> SinglePointContact:
+    point = np.array([np.nan, np.nan], dtype=float)
+    return SinglePointContact(
+        has_contact=False,
+        rail_point=point,
+        wheel_point=point,
+        wheel_profile_lateral=np.nan,
+        vertical_gap=np.inf,
+        vertical_penetration=0.0,
+        normal_penetration=0.0,
+        contact_angle=np.nan,
+    )

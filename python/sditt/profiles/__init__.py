@@ -1,10 +1,52 @@
-"""Wheel and rail profile readers."""
+"""Wheel and rail profile readers and geometry interpolation helpers."""
 
 from .loaders import ProfileData, discover_profile_files, load_profile_directory, load_profile_file
+from .geometry import (
+    BezierProfileData,
+    ContactTables,
+    MileageProfileEntry,
+    OffsetProfileRecord,
+    RailProfileRecord,
+    RailProfileSet,
+    TrackProfileSet,
+    WheelProfileSet,
+    build_track_profiles,
+    build_wheel_profiles,
+    contact_angles,
+    contact_tables,
+    create_bezier_profile_data,
+    curvature_radius,
+    extreme_points,
+    interpolate_rail_profiles,
+    offset_profile_to_track,
+    rail_curvature_radius,
+    read_mileage_profile_file,
+    wheel_curvature_radius,
+)
 
 __all__ = [
+    "BezierProfileData",
+    "ContactTables",
+    "MileageProfileEntry",
+    "OffsetProfileRecord",
     "ProfileData",
+    "RailProfileRecord",
+    "RailProfileSet",
+    "TrackProfileSet",
+    "WheelProfileSet",
+    "build_track_profiles",
+    "build_wheel_profiles",
+    "contact_angles",
+    "contact_tables",
+    "create_bezier_profile_data",
+    "curvature_radius",
     "discover_profile_files",
+    "extreme_points",
+    "interpolate_rail_profiles",
     "load_profile_directory",
     "load_profile_file",
+    "offset_profile_to_track",
+    "rail_curvature_radius",
+    "read_mileage_profile_file",
+    "wheel_curvature_radius",
 ]
