@@ -4,9 +4,7 @@ import argparse
 from pathlib import Path
 
 from sditt.config import ProjectPaths
-from sditt.io.matlab import summarize_mat_file
-from sditt.profiles import discover_profile_files, load_profile_file
-from sditt.vehicle import load_vehicle_parameters
+from sditt.io.dataset import inspect_raw_inputs, load_sditt_raw_inputs
 
 
 def main() -> None:
@@ -15,22 +13,26 @@ def main() -> None:
     args = parser.parse_args()
 
     paths = ProjectPaths.from_repo_root(args.root)
-    mat_summary = summarize_mat_file(paths.modal_turnout_mat)
-    vehicle = load_vehicle_parameters(paths.default_vehicle_parameters)
-    profile_files = discover_profile_files(paths.profile_dir)
-    sample_profile = load_profile_file(profile_files[0]) if profile_files else None
+    manifest = inspect_raw_inputs(paths.root)
+    raw_sample = load_sditt_raw_inputs(paths.root, max_profiles_per_kind=1)
 
-    print(f"MAT: {mat_summary.path}")
-    print(f"  variables: {len(mat_summary.variables)}")
-    for name, summary in list(mat_summary.variables.items())[:10]:
+    print(f"MAT: {manifest.modal_turnout_summary.path}")
+    print(f"  variables: {len(manifest.modal_turnout_summary.variables)}")
+    print(f"  ModeFreq.FT_All: {manifest.modal_frequencies_shape}")
+    for name, summary in list(manifest.modal_turnout_summary.variables.items())[:10]:
         print(f"  - {name}: {summary}")
-    print(f"Vehicle: {vehicle.path}")
-    print(f"  parsed parameters: {len(vehicle.values)}")
-    print(f"  unsupported statements: {len(vehicle.unsupported_statements)}")
+    print(f"Vehicle: {raw_sample.vehicle_parameters.path}")
+    print(f"  parsed parameters: {len(raw_sample.vehicle_parameters.values)}")
+    print(f"  unsupported statements: {len(raw_sample.vehicle_parameters.unsupported_statements)}")
     print(f"Profiles: {paths.profile_dir}")
-    print(f"  files: {len(profile_files)}")
-    if sample_profile is not None:
-        print(f"  sample: {sample_profile.path.name}, points={sample_profile.points.shape}")
+    print(f"  files: {len(manifest.profile_files)}")
+    print(f"  wheel files: {len(manifest.wheel_profile_files)}")
+    print(f"  rail files: {len(manifest.rail_profile_files)}")
+    for name, profiles in (("wheel", raw_sample.wheel_profiles), ("rail", raw_sample.rail_profiles)):
+        if profiles:
+            path, profile = next(iter(profiles.items()))
+            print(f"  sample {name}: {path}, points={profile.points.shape}")
+    print(f"Numeric text tables: {len(manifest.numeric_text_files)}")
 
 
 if __name__ == "__main__":

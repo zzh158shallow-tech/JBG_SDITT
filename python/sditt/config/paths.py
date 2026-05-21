@@ -30,3 +30,11 @@ class ProjectPaths:
     @property
     def default_vehicle_parameters(self) -> Path:
         return self.matlab_dir / "Par_Vehicle_CRH380A_v6.m"
+
+    @property
+    def wheel_profile_dir(self) -> Path:
+        return self.profile_dir / "wheel"
+
+    @property
+    def turnout_mileage_dir(self) -> Path:
+        return self.profile_dir / "07(009)-Mileage"

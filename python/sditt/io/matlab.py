@@ -106,6 +106,22 @@ def load_mat_file(path: str | Path) -> MatFile:
     return MatFile(path=file_path, header=description, variables=variables)
 
 
+def load_mat_variables(path: str | Path, names: set[str] | list[str] | tuple[str, ...]) -> MatFile:
+    """Read selected variables from a MATLAB v5 ``.mat`` file.
+
+    This avoids expanding large unrequested variables, which matters for the
+    flexible turnout modal files where the mode shapes dominate file size.
+    """
+
+    requested = set(names)
+    file_path = Path(path)
+    with file_path.open("rb") as stream:
+        header = stream.read(128)
+        description = header[:116].decode("latin1", errors="replace").strip()
+        variables = _read_selected_elements(stream, requested)
+    return MatFile(path=file_path, header=description, variables=variables)
+
+
 def summarize_mat_file(path: str | Path) -> MatSummary:
     file_path = Path(path)
     with file_path.open("rb") as stream:
@@ -163,6 +179,31 @@ def _read_elements(stream: BinaryIO) -> dict[str, Any]:
         elif data_type == MI_MATRIX:
             name, value = _parse_matrix(io.BytesIO(payload))
             variables[name] = value
+    return variables
+
+
+def _read_selected_elements(stream: BinaryIO, names: set[str]) -> dict[str, Any]:
+    variables: dict[str, Any] = {}
+    while True:
+        tag = _read_tag(stream)
+        if tag is None:
+            break
+        data_type, nbytes, small_data = tag
+        payload = small_data if small_data is not None else stream.read(nbytes)
+        if data_type != MI_COMPRESSED:
+            _skip_padding(stream, nbytes)
+
+        if data_type == MI_COMPRESSED:
+            name, _ = _read_compressed_matrix_summary(payload)
+            if name in names:
+                variables.update(_read_elements(io.BytesIO(zlib.decompress(payload))))
+        elif data_type == MI_MATRIX:
+            name, _ = _parse_matrix_summary(io.BytesIO(payload))
+            if name in names:
+                name, value = _parse_matrix(io.BytesIO(payload))
+                variables[name] = value
+        if names.issubset(variables.keys()):
+            break
     return variables
 
 
@@ -291,7 +332,8 @@ def _parse_struct(stream: BinaryIO, dimensions: tuple[int, ...]) -> dict[str, An
                 continue
             data_type, nbytes, small_data = tag
             payload = small_data if small_data is not None else stream.read(nbytes)
-            _skip_padding(stream, nbytes)
+            if small_data is None:
+                _skip_padding(stream, nbytes)
             if data_type == MI_MATRIX:
                 _, value = _parse_matrix(io.BytesIO(payload))
             elif data_type == MI_COMPRESSED:
@@ -316,7 +358,8 @@ def _parse_cell(stream: BinaryIO, dimensions: tuple[int, ...]) -> list[Any]:
             continue
         data_type, nbytes, small_data = tag
         payload = small_data if small_data is not None else stream.read(nbytes)
-        _skip_padding(stream, nbytes)
+        if small_data is None:
+            _skip_padding(stream, nbytes)
         if data_type == MI_MATRIX:
             _, value = _parse_matrix(io.BytesIO(payload))
             cells.append(value)
@@ -363,7 +406,8 @@ def _read_typed_payload(stream: BinaryIO) -> tuple[int, bytes]:
         return 0, b""
     data_type, nbytes, small_data = tag
     payload = small_data if small_data is not None else stream.read(nbytes)
-    _skip_padding(stream, nbytes)
+    if small_data is None:
+        _skip_padding(stream, nbytes)
     return data_type, payload
 
 

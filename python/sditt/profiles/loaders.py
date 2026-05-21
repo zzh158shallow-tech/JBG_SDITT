@@ -25,7 +25,7 @@ def discover_profile_files(root: str | Path) -> list[Path]:
     return sorted(
         path
         for path in root_path.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".txt", ".prr"}
+        if path.is_file() and _is_profile_candidate(path)
     )
 
 
@@ -41,7 +41,7 @@ def load_profile_directory(root: str | Path) -> dict[Path, ProfileData]:
 
 def load_profile_file(path: str | Path) -> ProfileData:
     file_path = Path(path)
-    if file_path.suffix.lower() == ".prr":
+    if file_path.suffix.lower() in {".prr", ".prw"}:
         return _load_prr_profile(file_path)
     return _load_txt_profile(file_path)
 
@@ -51,8 +51,14 @@ def _load_txt_profile(path: Path) -> ProfileData:
     return ProfileData(path=path, points=data.data, metadata={"format": "txt"})
 
 
+def _is_profile_candidate(path: Path) -> bool:
+    if path.suffix.lower() not in {".txt", ".prr", ".prw"}:
+        return False
+    return not any("mileage" in part.lower() for part in path.parts)
+
+
 def _load_prr_profile(path: Path) -> ProfileData:
-    metadata: dict[str, str] = {"format": "prr"}
+    metadata: dict[str, str] = {"format": path.suffix.lower().lstrip(".")}
     numeric_lines: list[str] = []
 
     for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():

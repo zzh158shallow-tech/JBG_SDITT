@@ -249,6 +249,154 @@ Full `pytest` was not run in the local system Python because `pytest` was not
 installed in the available runtime. The targeted smoke/assert script and
 `py_compile` passed.
 
+## Recommended Reproduction Roadmap
+
+Use a staged reproduction strategy: first build a minimal working loop, then
+add physical complexity module by module. Do not start by translating
+`Multi_Con_250812.m` mechanically; it mixes too many responsibilities and
+should be decomposed after the surrounding skeleton is clear.
+
+### Stage 0: Baseline Understanding
+
+1. Document the MATLAB main flow.
+   - Source: `SDITT_CR400_NoStrTIrr_250728_Face.m`
+   - Goal: identify inputs, state variables, outputs, stage switching
+     (`Preload` / `Cal`), and the nested time-step/iteration loops.
+   - Suggested artifact: `docs/matlab_flow.md`
+
+2. Inventory data files and dependencies.
+   - Goal: map `.mat`, `.txt`, wheel profiles, rail profiles, turnout modal
+     files, and preload files to the MATLAB functions that read them.
+   - Suggested artifact: `docs/data_inventory.md`
+
+### Stage 1: Python Project Skeleton
+
+3. Build the Python package structure.
+   - Suggested modules: `sditt.config`, `sditt.io`, `sditt.vehicle`,
+     `sditt.track`, `sditt.profiles`, `sditt.contact`,
+     `sditt.integrators`, `sditt.simulation`, and `sditt.outputs`.
+
+4. Implement MATLAB `.mat` / `.txt` loading utilities.
+   - First goal is reading data only, without physics.
+   - Important early targets: `Mat_FT_S8b.mat`, vehicle parameters, wheel
+     profiles, rail profiles, damping-ratio text files, and preload data.
+
+### Stage 2: Linear Dynamics Skeleton
+
+5. Reproduce vehicle parameters and rigid-wheelset vehicle matrices.
+   - Sources: `Par_Vehicle_CRH380A_v6.m`,
+     `Matrix_Vehicle_RW_230409.m`
+   - Goal: Python `M_vehicle`, `K_vehicle`, and `C_vehicle` match MATLAB
+     dimensions and numerical checks.
+
+6. Reproduce flexible turnout modal matrices.
+   - Source: `Matrix_Modal_FT_230313.m`
+   - Goal: build `M_track = I`,
+     `K_track = diag((2*pi*f)^2)`, and
+     `C_track = diag(2*xi*(2*pi*f))`.
+
+7. Assemble global system matrices.
+   - Source: main script block that builds `Mxt`, `Kxt`, `Cxt`.
+   - Goal: verify global DOF ordering, block placement, matrix shape, and
+     sparse/dense strategy.
+
+### Stage 3: Minimal Integrator Loop
+
+8. Reproduce `Integration_Park.m`.
+   - Start with a single-degree-of-freedom mass-spring-damper test.
+   - Then connect it to assembled vehicle-track matrices.
+   - Keep Newmark startup logic because Park integration needs previous
+     response history.
+
+9. Run a no-contact forced-response simulation.
+   - Use a simple prescribed external force.
+   - Goal: first Python time-marching loop with displacement, velocity, and
+     acceleration evolving correctly.
+
+### Stage 4: Contact Geometry First, Forces Later
+
+10. Reproduce wheel and rail profile loading/interpolation.
+    - Sources include `Radius_wheel.m`, `Par_Con.m`,
+      `Get_Profile_P1_Through_210624.m`,
+      `Get_Profile_P1_Through_CN18_250813.m`, and `Get_Profile_P2_v2.m`.
+
+11. Implement a simple single-wheelset/single-rail contact geometry path.
+    - First use one rail, one wheel, rigid wheelset, and Hertz-like single
+      point detection.
+    - Goal: contact point, normal penetration, and contact angle can be
+      computed and compared with MATLAB intermediate values.
+
+12. Add multi-point contact screening and quasi-elastic correction.
+    - Sources: `Extreme_Boundary.m`, `Quasi_Elastic_Correction.m`
+    - Goal: reproduce the contact-point selection part of
+      `Multi_Con_250812.m` before adding full force calculation.
+
+### Stage 5: Normal and Tangential Contact Forces
+
+13. Implement Hertz normal force first.
+    - This is a debugging baseline because it is simpler than STRIPES.
+
+14. Implement STRIPES normal contact.
+    - Source: `NF_STRIPES_230623.m`
+    - Goal: for the same contact geometry, Python normal forces should align
+      with MATLAB.
+
+15. Implement Hu-Guo normal contact damping.
+    - Source: `Multi_Con_250812.m`, section around normal damping.
+    - Goal: separate and verify elastic normal force, damping normal force,
+      and total normal force.
+
+16. Implement tangential creepage and creep force.
+    - First reproduce the currently active MATLAB path:
+      Kalker linear creep coefficients plus nonlinear saturation correction.
+    - Treat `FASTSIM.m` as a later enhancement unless explicitly requested.
+
+### Stage 6: Full Coupled Loop
+
+17. Map wheel-rail forces to the vehicle subsystem.
+    - Source: `WR_Force_VehicleSys_RotationIII.m`
+
+18. Map wheel-rail forces to flexible turnout modal coordinates.
+    - Source: `WR_Force_ModalFT.m`
+
+19. Recover physical rail response from modal coordinates.
+    - Source: `RailDyn_ModalFT.m`
+
+20. Connect the complete coupled time-step loop.
+    - Per time step: integrate response, recover rail response, reconstruct
+      contact geometry, compute contact force, check force convergence, and
+      continue iteration or reduce time step.
+
+### Stage 7: Validation and Optimization
+
+21. Validate tiny cases first.
+    - Suggested first case: one wheelset, short mileage range, no random track
+      irregularity, rigid wheelset.
+
+22. Validate the MATLAB default case.
+    - Default target: `07(009)`, `Face`, `350 km/h`, `FT-Modal`,
+      `STRIPES&ConDamp`.
+
+23. Optimize only after numerical agreement is credible.
+    - Candidate optimizations: `numpy` vectorization, `scipy.sparse`, cached
+      interpolators, cached shape functions, and avoiding repeated matrix
+      inverse/construction inside loops.
+
+### Suggested Task Batches
+
+- Batch 1: main-flow documentation and data inventory.
+- Batch 2: Python project skeleton and data readers.
+- Batch 3: vehicle matrices, turnout modal matrices, and global matrices.
+- Batch 4: Park integrator minimal loop.
+- Batch 5: wheel-rail contact geometry.
+- Batch 6: STRIPES, Hu-Guo damping, and tangential force.
+- Batch 7: complete coupled main loop and validation.
+
+The key rule is to compare Python and MATLAB intermediate variables at every
+stage. Waiting until the full program runs before debugging will make errors
+hard to isolate, especially indexing, coordinate-transform, and contact-force
+aggregation mistakes.
+
 ## Current Defaults Observed
 
 In `SDITT_CR400_NoStrTIrr_250728_Face.m`:
