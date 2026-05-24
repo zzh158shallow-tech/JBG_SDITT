@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal, overload
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 from sditt.profiles.geometry import contact_tables
 
@@ -14,6 +15,12 @@ class StripePatchResult:
 
     wheel_points: np.ndarray
     rail_points: np.ndarray
+    penetration_raw: np.ndarray
+    penetration_overlap: np.ndarray
+    penetration_window: np.ndarray
+    stripe_y: np.ndarray
+    stripe_penetration: np.ndarray
+    stripe_dy: np.ndarray
     curvature: np.ndarray
     stripes: np.ndarray
     normal_force: float
@@ -44,6 +51,29 @@ class KalkerTangentialForceResult:
     saturated_tangent_norm: np.ndarray
     saturation_scale: np.ndarray
     force_track: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class CachedLinearInterpolator:
+    """Small cached wrapper around sorted ``np.interp`` inputs."""
+
+    x: np.ndarray
+    y: np.ndarray
+
+    @classmethod
+    def from_columns(cls, table: np.ndarray, x_col: int, y_col: int) -> "CachedLinearInterpolator":
+        data = np.asarray(table, dtype=float)
+        order = np.argsort(data[:, x_col], kind="mergesort")
+        x_sorted = data[order, x_col]
+        y_sorted = data[order, y_col]
+        unique_x, unique_indexes = np.unique(x_sorted, return_index=True)
+        return cls(unique_x, y_sorted[unique_indexes])
+
+    def __call__(self, x_new: float | np.ndarray) -> float | np.ndarray:
+        out = np.interp(x_new, self.x, self.y)
+        if np.isscalar(x_new):
+            return float(out)
+        return out
 
 
 @overload
@@ -136,6 +166,8 @@ def stripes_normal_force(
 
     wheel_radius = _sort_points(wheel_radius_profile)
     rail_radius = _sort_points(rail_radius_profile)
+    wheel_radius_interp = CachedLinearInterpolator.from_columns(wheel_radius, 0, 1)
+    rail_radius_interp = CachedLinearInterpolator.from_columns(rail_radius, 0, 1)
     con_wheel_track = np.asarray(contact_wheel_track, dtype=float)
     con_wheel_local = np.asarray(contact_wheel_local, dtype=float)
     con_rail_track = np.asarray(contact_rail_track, dtype=float)
@@ -145,6 +177,8 @@ def stripes_normal_force(
     wheel_to_track = np.asarray(wheel_to_track, dtype=float)
     transforms = _as_transform_tuple(contact_to_track, con_wheel_track.shape[0])
     bgmn_table = contact_tables().bgmn if bgmn is None else np.asarray(bgmn, dtype=float)
+    bgmn_m = CachedLinearInterpolator.from_columns(bgmn_table, 0, 1)
+    bgmn_n = CachedLinearInterpolator.from_columns(bgmn_table, 0, 2)
 
     patch_count = peaks.shape[0]
     if patch_count == 0:
@@ -173,12 +207,12 @@ def stripes_normal_force(
     area = np.zeros((patch_count,), dtype=float)
     patch_results: list[StripePatchResult] = []
     previous_penetration_end_track: np.ndarray | None = None
+    rail_track_3d = np.column_stack((np.zeros(rail.shape[0]), rail[:, 0], rail[:, 1]))
 
     for i in range(patch_count):
         transform = transforms[i]
         wheel_scope = _patch_wheel_scope(wheel[:, 1], peaks[:, 1], i)
         wheel_con = _right_matrix_divide(wheel[wheel_scope, :] - con_wheel_track[i, :3], transform)
-        rail_track_3d = np.column_stack((np.zeros(rail.shape[0]), rail[:, 0], rail[:, 1]))
         rail_origin_3d = np.array([0.0, con_rail_track[i, 0], con_rail_track[i, 1]], dtype=float)
         rail_con_all = _right_matrix_divide(rail_track_3d - rail_origin_3d, transform)
 
@@ -192,16 +226,23 @@ def stripes_normal_force(
         rail_z_near = _interp_columns(rail_con_all[:, 1], rail_con_all[:, [2]], wheel_near[:, 1])[:, 0]
         normal_gap = rail_z_near - wheel_near[:, 2]
         virtual_penetration = np.column_stack((wheel_near[:, 1], h0[i] - normal_gap))
-        penetration_window, previous_penetration_end_track = _trim_virtual_penetration(
+        penetration_overlap, penetration_window, previous_penetration_end_track = _trim_virtual_penetration(
             virtual_penetration,
             wheel_near,
             transform,
             con_wheel_track[i, :3],
             previous_penetration_end_track,
+            apply_monotonic_filter=patch_count != 1,
         )
         positive = penetration_window[:, 1] > 0.0
         if not np.any(positive):
-            patch_results.append(_empty_stripe_patch())
+            patch_results.append(
+                _empty_stripe_patch(
+                    penetration_raw=virtual_penetration,
+                    penetration_overlap=penetration_overlap,
+                    penetration_window=penetration_window,
+                )
+            )
             continue
 
         stripe_y, stripe_penetration, dy = _stripe_samples(penetration_window, positive, stripe_count)
@@ -209,7 +250,7 @@ def stripes_normal_force(
 
         wheel_con_stripe = np.empty((stripe_count_i, 3), dtype=float)
         wheel_con_stripe[:, 1] = stripe_y
-        wheel_con_stripe[:, [0, 2]] = _interp_columns(wheel_con[:, 1], wheel_con[:, [0, 2]], stripe_y)
+        wheel_con_stripe[:, [0, 2]] = _interp_columns(wheel_con[:, 1], wheel_con[:, [0, 2]], stripe_y, method="spline")
         wheel_track_stripe = wheel_con_stripe @ transform + con_wheel_track[i, :3]
         wheel_local_stripe = _right_matrix_divide(
             wheel_track_stripe - np.array([0.0, wheel_lateral, 0.0], dtype=float),
@@ -223,17 +264,17 @@ def stripes_normal_force(
         rail_patch = rail_track_stripe[:, 1:3] + con_rail_track[i, :2]
 
         r_yy_w, r_xx_w, r_xx_r, rou = _contact_radii(
-            wheel_radius,
-            rail_radius,
+            wheel_radius_interp,
+            rail_radius_interp,
             wheel_local_stripe,
             rail_patch,
         )
         beta = np.arccos(np.clip(rou / 4.0 * np.abs(1.0 / r_yy_w - 1.0 / r_xx_w - 1.0 / r_xx_r), -1.0, 1.0))
-        m_j = np.interp(beta, bgmn_table[:, 0], bgmn_table[:, 1])
-        n_j = np.interp(beta, bgmn_table[:, 0], bgmn_table[:, 2])
+        m_j = bgmn_m(beta)
+        n_j = bgmn_n(beta)
         a_j = 0.5 / r_yy_w
         b_j_ori = 0.5 * (1.0 / r_xx_w + 1.0 / r_xx_r)
-        b_j = _smooth_five_point(b_j_ori) if stripe_count_i > 1 else b_j_ori
+        b_j = _smooth_lowess(b_j_ori, span=5) if stripe_count_i > 1 else b_j_ori
 
         active = stripe_penetration >= 0.0
         if correction == "A":
@@ -257,6 +298,12 @@ def stripes_normal_force(
             StripePatchResult(
                 wheel_points=wheel_local_stripe,
                 rail_points=rail_patch,
+                penetration_raw=virtual_penetration,
+                penetration_overlap=penetration_overlap,
+                penetration_window=penetration_window,
+                stripe_y=stripe_y,
+                stripe_penetration=stripe_penetration,
+                stripe_dy=dy,
                 curvature=curvature,
                 stripes=stripes,
                 normal_force=normal_force[i, 4],
@@ -512,14 +559,14 @@ def _saturated_tangent_norm(linear_norm: np.ndarray, normal_force: np.ndarray, f
 
 
 def _contact_radii(
-    wheel_radius_profile: np.ndarray,
-    rail_radius_profile: np.ndarray,
+    wheel_radius_profile: CachedLinearInterpolator,
+    rail_radius_profile: CachedLinearInterpolator,
     wheel_points: np.ndarray,
     rail_points: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     r_yy_w = wheel_points[:, 2]
-    r_xx_w = np.interp(wheel_points[:, 1], wheel_radius_profile[:, 0], wheel_radius_profile[:, 1])
-    r_xx_r = np.interp(rail_points[:, 0], rail_radius_profile[:, 0], rail_radius_profile[:, 1])
+    r_xx_w = wheel_radius_profile(wheel_points[:, 1])
+    r_xx_r = rail_radius_profile(rail_points[:, 0])
     adjust = (r_xx_w < 0.0) & (np.abs(r_xx_w) * 0.9 <= np.abs(r_xx_r))
     r_xx_r = np.where(adjust, np.abs(r_xx_w) * 0.9, r_xx_r)
     r_xx_r = np.where(np.abs(r_xx_r) > 1.0, 1.0, r_xx_r)
@@ -543,10 +590,13 @@ def _trim_virtual_penetration(
     transform: np.ndarray,
     contact_wheel_track: np.ndarray,
     previous_end_track: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray | None]:
+    *,
+    apply_monotonic_filter: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     positive = virtual_penetration[:, 1] > 0.0
     if not np.any(positive):
-        return virtual_penetration[:0, :], previous_end_track
+        empty = virtual_penetration[:0, :]
+        return empty, empty, previous_end_track
 
     positive_indexes = np.flatnonzero(positive)
     limits_con = wheel_near[[positive_indexes[0], positive_indexes[-1]], :]
@@ -556,14 +606,17 @@ def _trim_virtual_penetration(
         left_con = _right_matrix_divide(previous_end_track - contact_wheel_track, transform)
         trimmed = trimmed[trimmed[:, 0] > left_con[1], :]
 
-    if trimmed.shape[0] > 1:
+    overlap_trimmed = trimmed
+
+    if apply_monotonic_filter and trimmed.shape[0] > 1:
         starts = np.flatnonzero((trimmed[:-1, 1] <= 0.0) & (trimmed[1:, 1] >= 0.0))
         ends = np.flatnonzero((trimmed[:-1, 1] >= 0.0) & (trimmed[1:, 1] <= 0.0))
-        if starts.size == ends.size and starts.size > 0 and np.any(trimmed[starts, 0] > trimmed[ends, 0]):
-            trimmed = trimmed[(trimmed[:, 0] < trimmed[starts[-1], 0]) & (trimmed[:, 0] > trimmed[ends[0], 0]), :]
-        elif starts.size > ends.size and starts.size > 0:
+        if starts.size == ends.size:
+            if starts.size > 0 and np.any(trimmed[starts, 0] > trimmed[ends, 0]):
+                trimmed = trimmed[(trimmed[:, 0] < trimmed[starts[-1], 0]) & (trimmed[:, 0] > trimmed[ends[0], 0]), :]
+        elif starts.size > ends.size:
             trimmed = trimmed[trimmed[:, 0] < trimmed[starts[-1], 0], :]
-        elif starts.size < ends.size and ends.size > 0:
+        elif starts.size < ends.size:
             trimmed = trimmed[trimmed[:, 0] > trimmed[ends[0], 0], :]
 
     positive = trimmed[:, 1] > 0.0
@@ -572,7 +625,7 @@ def _trim_virtual_penetration(
         end_y = trimmed[indexes[-1], 0]
         end_xz = _interp_columns(wheel_near[:, 1], wheel_near[:, [0, 2]], np.array([end_y]))[0]
         previous_end_track = np.array([end_xz[0], end_y, end_xz[1]]) @ transform + contact_wheel_track
-    return trimmed, previous_end_track
+    return overlap_trimmed, trimmed, previous_end_track
 
 
 def _stripe_samples(
@@ -611,7 +664,13 @@ def _right_matrix_divide(values: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return np.linalg.solve(np.asarray(matrix, dtype=float).T, np.asarray(values, dtype=float).T).T
 
 
-def _interp_columns(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+def _interp_columns(
+    x: np.ndarray,
+    y: np.ndarray,
+    x_new: np.ndarray,
+    *,
+    method: str = "linear",
+) -> np.ndarray:
     order = np.argsort(x)
     x_sorted = np.asarray(x, dtype=float)[order]
     y_sorted = np.asarray(y, dtype=float)[order]
@@ -619,18 +678,54 @@ def _interp_columns(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarr
     y_unique = y_sorted[unique_index]
     if y_unique.ndim == 1:
         y_unique = y_unique[:, np.newaxis]
-    return np.column_stack([np.interp(x_new, unique_x, y_unique[:, col]) for col in range(y_unique.shape[1])])
+    if method == "linear" or unique_x.size < 4:
+        return np.column_stack([np.interp(x_new, unique_x, y_unique[:, col]) for col in range(y_unique.shape[1])])
+    if method != "spline":
+        raise ValueError("method must be 'linear' or 'spline'")
+    return np.column_stack([CubicSpline(unique_x, y_unique[:, col])(x_new) for col in range(y_unique.shape[1])])
 
 
-def _smooth_five_point(values: np.ndarray) -> np.ndarray:
+def _smooth_lowess(values: np.ndarray, *, span: int) -> np.ndarray:
+    """Replicate MATLAB ``smooth(y, span, 'lowess')`` for equally spaced y."""
+
     data = np.asarray(values, dtype=float)
-    if data.size < 5:
+    if data.size < 2:
         return data.copy()
+    window = max(2, min(int(span), data.size))
     out = data.copy()
     for i in range(data.size):
-        start = max(0, i - 2)
-        end = min(data.size, i + 3)
-        out[i] = float(np.mean(data[start:end]))
+        start = i - window // 2
+        end = start + window
+        if start < 0:
+            start = 0
+            end = window
+        if end > data.size:
+            end = data.size
+            start = end - window
+        x_window = np.arange(start, end, dtype=float)
+        y_window = data[start:end]
+        finite = np.isfinite(y_window)
+        if np.count_nonzero(finite) < 2:
+            out[i] = y_window[finite][0] if np.any(finite) else np.nan
+            continue
+        x_fit = x_window[finite]
+        y_fit = y_window[finite]
+        distances = np.abs(x_fit - float(i))
+        max_distance = float(np.max(distances))
+        if max_distance == 0.0:
+            out[i] = float(y_fit[0])
+            continue
+        weights = (1.0 - (distances / max_distance) ** 3) ** 1.5
+        active = weights > 0.0
+        if np.count_nonzero(active) < 2:
+            out[i] = float(y_fit[np.argmin(distances)])
+            continue
+        design = np.column_stack((np.ones(np.count_nonzero(active)), x_fit[active] - float(i)))
+        sqrt_weights = np.sqrt(weights[active])
+        weighted_design = design * sqrt_weights[:, np.newaxis]
+        weighted_y = y_fit[active] * sqrt_weights
+        coefficients, *_ = np.linalg.lstsq(weighted_design, weighted_y, rcond=None)
+        out[i] = float(coefficients[0])
     return out
 
 
@@ -668,10 +763,21 @@ def _as_transform_tuple(transforms: tuple[np.ndarray, ...] | np.ndarray, patch_c
     raise ValueError("contact_to_track must be a 3x3 matrix or an array of per-patch 3x3 matrices")
 
 
-def _empty_stripe_patch() -> StripePatchResult:
+def _empty_stripe_patch(
+    *,
+    penetration_raw: np.ndarray | None = None,
+    penetration_overlap: np.ndarray | None = None,
+    penetration_window: np.ndarray | None = None,
+) -> StripePatchResult:
     return StripePatchResult(
         wheel_points=np.empty((0, 3), dtype=float),
         rail_points=np.empty((0, 2), dtype=float),
+        penetration_raw=np.empty((0, 2), dtype=float) if penetration_raw is None else penetration_raw,
+        penetration_overlap=np.empty((0, 2), dtype=float) if penetration_overlap is None else penetration_overlap,
+        penetration_window=np.empty((0, 2), dtype=float) if penetration_window is None else penetration_window,
+        stripe_y=np.empty((0,), dtype=float),
+        stripe_penetration=np.empty((0,), dtype=float),
+        stripe_dy=np.empty((0,), dtype=float),
         curvature=np.empty((0, 10), dtype=float),
         stripes=np.empty((0, 3), dtype=float),
         normal_force=0.0,

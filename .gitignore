@@ -17,3 +17,5 @@ SDITT-RW-FT-250728/CRH380A_009_Face_V350_zgygPf2.mat
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.egg-info/
+python/outputs/*

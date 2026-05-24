@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import comb
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
+from scipy.interpolate import make_smoothing_spline
 
 from sditt.profiles.loaders import load_profile_file
 
@@ -250,7 +251,13 @@ def curvature_radius(profile: np.ndarray) -> np.ndarray:
 def wheel_curvature_radius(profile: np.ndarray, *, vehicle_type: str = "CRH380A") -> np.ndarray:
     """Wheel rolling-radius table with MATLAB's side-specific masking conventions."""
 
-    radius = curvature_radius(profile)
+    smoothing = 1.0 - (5.0e-10 if vehicle_type == "CR400BF" else 5.0e-12)
+    radius = radius_profile_v3(
+        profile,
+        smoothing=smoothing,
+        smooth_profile=True,
+        smooth_radius=True,
+    )
     radius[:, 1] *= -1.0
     if vehicle_type == "CR400BF":
         x_new = np.arange(np.nanmin(radius[:, 0]), np.nanmax(radius[:, 0]) + 0.0001 / 2, 0.0001)
@@ -266,9 +273,55 @@ def wheel_curvature_radius(profile: np.ndarray, *, vehicle_type: str = "CRH380A"
 def rail_curvature_radius(profile: np.ndarray) -> np.ndarray:
     """Rail radius table used by profile interpolation, returned as absolute radius."""
 
-    radius = curvature_radius(profile)
+    radius = radius_profile_v3(profile, smoothing=1.0 - 5.0e-8, smooth_profile=True, smooth_radius=True)
     radius[:, 1] = np.abs(radius[:, 1])
     return radius
+
+
+def radius_profile_v3(
+    profile: np.ndarray,
+    *,
+    smoothing: float,
+    smooth_profile: bool,
+    smooth_radius: bool,
+) -> np.ndarray:
+    """Approximate MATLAB ``Radius_profile_v3(profile, p, Choose_1, Choose_2)``."""
+
+    points = sort_points(profile)
+    if points.shape[0] < 3:
+        return curvature_radius(points)
+
+    x = points[:, 0]
+    z = points[:, 1]
+    if smooth_profile:
+        z0 = _csaps_values(x, z, smoothing)
+        dz_dx = np.gradient(z0, x)
+        dz_dx = _csaps_values(x, dz_dx, smoothing)
+        d2z_dx2 = np.gradient(dz_dx, x)
+        d2z_dx2 = _csaps_values(x, d2z_dx2, smoothing)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curvature = d2z_dx2 / ((1.0 + dz_dx**2) ** 1.5)
+            if smooth_radius:
+                curvature = _csaps_values(x, curvature, smoothing)
+            radius = 1.0 / curvature
+        return np.column_stack((x, radius))
+
+    radius = curvature_radius(points)
+    if smooth_radius:
+        radius[:, 1] = _csaps_values(radius[:, 0], radius[:, 1], smoothing)
+    return radius
+
+
+def _csaps_values(x: np.ndarray, y: np.ndarray, smoothing: float) -> np.ndarray:
+    finite = np.isfinite(x) & np.isfinite(y)
+    if np.count_nonzero(finite) < 3:
+        return np.asarray(y, dtype=float).copy()
+    p = float(np.clip(smoothing, np.finfo(float).eps, 1.0))
+    lam = (1.0 - p) / p
+    spline = make_smoothing_spline(x[finite], y[finite], lam=lam)
+    out = np.asarray(y, dtype=float).copy()
+    out[finite] = spline(x[finite])
+    return out
 
 
 def extreme_points(profile: np.ndarray, *, kind: str | None = None) -> np.ndarray:
@@ -383,6 +436,7 @@ def interpolate_rail_profiles(
     same_rear_profile: bool,
     bezier: BezierProfileData | None = None,
     num_interp: int = 1000,
+    radius_smoothing: float | Callable[[float], float] = 1.0 - 5.0e-8,
 ) -> RailProfileSet:
     """Generate per-wheel rail profiles, mirroring MATLAB ``Create_prrFile.m`` behavior."""
 
@@ -391,6 +445,7 @@ def interpolate_rail_profiles(
     records: dict[str, RailProfileRecord] = {}
     for station in WHEEL_STATIONS:
         mileage = j1 - station_distances[station]
+        smoothing = radius_smoothing(mileage) if callable(radius_smoothing) else radius_smoothing
         records[station] = _interpolate_one_rail_profile(
             mileage,
             entries,
@@ -398,6 +453,7 @@ def interpolate_rail_profiles(
             same_rear_profile=same_rear_profile,
             bezier=bezier,
             num_interp=num_interp,
+            radius_smoothing=float(smoothing),
         )
     return RailProfileSet(by_station=records)
 
@@ -493,6 +549,7 @@ def _interpolate_one_rail_profile(
     same_rear_profile: bool,
     bezier: BezierProfileData | None,
     num_interp: int,
+    radius_smoothing: float,
 ) -> RailProfileRecord:
     first = entries[0]
     last = entries[-1]
@@ -500,12 +557,12 @@ def _interpolate_one_rail_profile(
         if not same_front_profile:
             return _empty_rail_profile()
         profile = sort_points(load_profile_file(first.profile_file).points[:, :2])
-        return _rail_record(1, profile, profile, profile)
+        return _rail_record(1, profile, profile, profile, radius_smoothing=radius_smoothing)
     if mileage > last.mileage:
         if not same_rear_profile:
             return _empty_rail_profile()
         profile = sort_points(load_profile_file(last.profile_file).points[:, :2])
-        return _rail_record(len(entries), profile, profile, profile)
+        return _rail_record(len(entries), profile, profile, profile, radius_smoothing=radius_smoothing)
 
     mileage_values = np.array([entry.mileage for entry in entries], dtype=float)
     profile_index = int(np.searchsorted(mileage_values, mileage, side="left"))
@@ -520,7 +577,7 @@ def _interpolate_one_rail_profile(
     profile = _bezier_profile_at(mileage, bezier, num_interp) if bezier is not None else None
     if profile is None:
         profile = _linear_profile_between(front, rear, mileage, front_entry.mileage, rear_entry.mileage, num_interp)
-    return _rail_record(profile_index + 1, sort_points(profile), front, rear)
+    return _rail_record(profile_index + 1, sort_points(profile), front, rear, radius_smoothing=radius_smoothing)
 
 
 def _rail_record(
@@ -528,6 +585,8 @@ def _rail_record(
     profile: np.ndarray,
     front: np.ndarray,
     rear: np.ndarray,
+    *,
+    radius_smoothing: float = 1.0 - 5.0e-8,
 ) -> RailProfileRecord:
     return RailProfileRecord(
         profile_num=profile_num,
@@ -536,8 +595,19 @@ def _rail_record(
         rear_profile=rear,
         front_extreme=extreme_points(front),
         rear_extreme=extreme_points(rear),
-        radius=rail_curvature_radius(profile),
+        radius=_absolute_radius_profile_v3(profile, radius_smoothing),
     )
+
+
+def _absolute_radius_profile_v3(profile: np.ndarray, radius_smoothing: float) -> np.ndarray:
+    radius = radius_profile_v3(
+        profile,
+        smoothing=radius_smoothing,
+        smooth_profile=True,
+        smooth_radius=True,
+    )
+    radius[:, 1] = np.abs(radius[:, 1])
+    return radius
 
 
 def _empty_rail_profile() -> RailProfileRecord:

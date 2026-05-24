@@ -25,10 +25,17 @@ from .forces import (
     normal_damping_window,
     stripes_normal_force,
 )
+from .full_case import (
+    DefaultTrackContactParameters,
+    FullCaseWheelRailContactResult,
+    solve_default_wheel_rail_contact,
+)
 
 __all__ = [
     "BoundaryExtrema",
     "ContactPatch",
+    "DefaultTrackContactParameters",
+    "FullCaseWheelRailContactResult",
     "KalkerTangentialForceResult",
     "MultiPointContactGeometry",
     "SinglePointContact",
@@ -46,6 +53,7 @@ __all__ = [
     "normal_damping_window",
     "quasi_elastic_correction",
     "single_point_contact_geometry",
+    "solve_default_wheel_rail_contact",
     "stripes_normal_force",
     "trace_wheel_profile",
 ]

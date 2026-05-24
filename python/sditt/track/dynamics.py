@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class ShapeFunctionEntry:
+    shape_y: np.ndarray
+    shape_z: np.ndarray
+    shape_roty: np.ndarray
+    shape_rotz: np.ndarray
+    map_y: np.ndarray
+    map_z: np.ndarray
+    map_roty: np.ndarray
+    map_rotz: np.ndarray
 
 
 def rail_dyn_modal_ft(
@@ -42,6 +55,7 @@ def rail_dyn_modal_ft(
 
     dof_num = 4
     dof_columns = np.array([1, 2, 4, 5], dtype=int)
+    shape_cache: dict[tuple[str, str], ShapeFunctionEntry] = {}
 
     for rail in type_rail:
         mode_shape = np.asarray(_field(_field(inp_par, "ModeShape"), rail), dtype=float)
@@ -64,22 +78,14 @@ def rail_dyn_modal_ft(
         for patch in range(n_contact_patch):
             rail = type_rail[patch]
             contact = n_contact_patch * wheel + patch
-            shape_y = np.asarray(_field(shape_function, f"{wheelset}_{rail}_Y"), dtype=float).reshape(-1)
-            if shape_y.size == 0:
+            shape_entry = _shape_function_entry(shape_function, wheelset, rail, shape_cache)
+            if shape_entry.shape_y.size == 0:
                 continue
 
-            shape_z = np.asarray(_field(shape_function, f"{wheelset}_{rail}_Z"), dtype=float).reshape(-1)
-            shape_roty = np.asarray(_field(shape_function, f"{wheelset}_{rail}_ROTY"), dtype=float).reshape(-1)
-            shape_rotz = np.asarray(_field(shape_function, f"{wheelset}_{rail}_ROTZ"), dtype=float).reshape(-1)
-            map_y = _matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_Y"))
-            map_z = _matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_Z"))
-            map_roty = _matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_ROTY"))
-            map_rotz = _matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_ROTZ"))
-
             dyn_dis, dyn_vel, dyn_acc = dyn_track[rail]
-            _fill_contact_response(dis_rail[contact, :], dyn_dis, shape_y, shape_z, shape_roty, shape_rotz, map_y, map_z, map_roty, map_rotz)
-            _fill_contact_response(vel_rail[contact, :], dyn_vel, shape_y, shape_z, shape_roty, shape_rotz, map_y, map_z, map_roty, map_rotz)
-            _fill_contact_response(acc_rail[contact, :], dyn_acc, shape_y, shape_z, shape_roty, shape_rotz, map_y, map_z, map_roty, map_rotz)
+            _fill_contact_response(dis_rail[contact, :], dyn_dis, shape_entry)
+            _fill_contact_response(vel_rail[contact, :], dyn_vel, shape_entry)
+            _fill_contact_response(acc_rail[contact, :], dyn_acc, shape_entry)
 
     return dis_rail, vel_rail, acc_rail, dyn_status_rail
 
@@ -87,19 +93,33 @@ def rail_dyn_modal_ft(
 def _fill_contact_response(
     row: np.ndarray,
     vector: np.ndarray,
-    shape_y: np.ndarray,
-    shape_z: np.ndarray,
-    shape_roty: np.ndarray,
-    shape_rotz: np.ndarray,
-    map_y: np.ndarray,
-    map_z: np.ndarray,
-    map_roty: np.ndarray,
-    map_rotz: np.ndarray,
+    shape: ShapeFunctionEntry,
 ) -> None:
-    row[1] = shape_y @ vector[map_y]
-    row[2] = shape_z @ vector[map_z]
-    row[4] = shape_roty @ vector[map_roty]
-    row[5] = shape_rotz @ vector[map_rotz]
+    row[1] = shape.shape_y @ vector[shape.map_y]
+    row[2] = shape.shape_z @ vector[shape.map_z]
+    row[4] = shape.shape_roty @ vector[shape.map_roty]
+    row[5] = shape.shape_rotz @ vector[shape.map_rotz]
+
+
+def _shape_function_entry(
+    shape_function: Any,
+    wheelset: str,
+    rail: str,
+    cache: dict[tuple[str, str], ShapeFunctionEntry],
+) -> ShapeFunctionEntry:
+    key = (wheelset, rail)
+    if key not in cache:
+        cache[key] = ShapeFunctionEntry(
+            shape_y=np.asarray(_field(shape_function, f"{wheelset}_{rail}_Y"), dtype=float).reshape(-1),
+            shape_z=np.asarray(_field(shape_function, f"{wheelset}_{rail}_Z"), dtype=float).reshape(-1),
+            shape_roty=np.asarray(_field(shape_function, f"{wheelset}_{rail}_ROTY"), dtype=float).reshape(-1),
+            shape_rotz=np.asarray(_field(shape_function, f"{wheelset}_{rail}_ROTZ"), dtype=float).reshape(-1),
+            map_y=_matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_Y")),
+            map_z=_matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_Z")),
+            map_roty=_matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_ROTY")),
+            map_rotz=_matlab_rows_to_python(_field(shape_function, f"{wheelset}_{rail}_Mapping_DynStatus_ROTZ")),
+        )
+    return cache[key]
 
 
 def _state_column(state: np.ndarray, n_track: int) -> np.ndarray:

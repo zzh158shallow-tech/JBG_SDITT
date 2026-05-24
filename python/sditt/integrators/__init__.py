@@ -3,6 +3,7 @@
 from .park import (
     LinearSecondOrderSystem,
     NewmarkCoefficients,
+    PreparedLinearStepper,
     TimeHistory,
     initial_acceleration,
     integrate_park_newmark,
@@ -13,6 +14,7 @@ from .park import (
 __all__ = [
     "LinearSecondOrderSystem",
     "NewmarkCoefficients",
+    "PreparedLinearStepper",
     "TimeHistory",
     "initial_acceleration",
     "integrate_park_newmark",

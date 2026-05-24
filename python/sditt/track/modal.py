@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
+from scipy import sparse
 
 from sditt.io.matlab import (
     MatFile,
@@ -18,9 +20,9 @@ from sditt.io.matlab import (
 class ModalTrackMatrices:
     """Flexible turnout modal matrices and damping ratios."""
 
-    M_track: np.ndarray
-    K_track: np.ndarray
-    C_track: np.ndarray
+    mass_diag: np.ndarray
+    stiffness_diag: np.ndarray
+    damping_diag: np.ndarray
     DR: np.ndarray
     mode_freq: np.ndarray
     cut_freq: float
@@ -28,6 +30,30 @@ class ModalTrackMatrices:
     @property
     def omega(self) -> np.ndarray:
         return 2.0 * np.pi * self.mode_freq[:, 1]
+
+    @cached_property
+    def M_track(self) -> np.ndarray:
+        return np.diag(self.mass_diag)
+
+    @cached_property
+    def K_track(self) -> np.ndarray:
+        return np.diag(self.stiffness_diag)
+
+    @cached_property
+    def C_track(self) -> np.ndarray:
+        return np.diag(self.damping_diag)
+
+    @cached_property
+    def M_track_sparse(self) -> sparse.csr_matrix:
+        return sparse.diags(self.mass_diag, format="csr")
+
+    @cached_property
+    def K_track_sparse(self) -> sparse.csr_matrix:
+        return sparse.diags(self.stiffness_diag, format="csr")
+
+    @cached_property
+    def C_track_sparse(self) -> sparse.csr_matrix:
+        return sparse.diags(self.damping_diag, format="csr")
 
 
 def load_modal_turnout_data(path: str | Path) -> MatFile:
@@ -72,9 +98,9 @@ def build_modal_track_matrices(
 
     n_track = mode_freq.shape[0]
     return ModalTrackMatrices(
-        M_track=np.eye(n_track, dtype=float),
-        K_track=np.diag(omega**2),
-        C_track=np.diag(2.0 * xi * omega),
+        mass_diag=np.ones(n_track, dtype=float),
+        stiffness_diag=omega**2,
+        damping_diag=2.0 * xi * omega,
         DR=np.column_stack([mode_freq[:, 1], xi]),
         mode_freq=mode_freq,
         cut_freq=float(cut_freq),

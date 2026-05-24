@@ -7,6 +7,7 @@ import numpy as np
 
 from sditt.integrators import (
     LinearSecondOrderSystem,
+    PreparedLinearStepper,
     initial_acceleration,
     newmark_step,
     park_step,
@@ -16,6 +17,7 @@ from sditt.integrators import (
 StateCallback = Callable[["CoupledStepState"], Any]
 ContactForceCallback = Callable[["CoupledStepState", Any, Any], np.ndarray]
 ExternalForceCallback = Callable[[float], np.ndarray]
+ConvergenceCallback = Callable[["CoupledStepState", Any, Any, np.ndarray, np.ndarray, "CoupledIterationSettings"], bool]
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class CoupledStepCallbacks:
     contact_geometry: Callable[["CoupledStepState", Any], Any]
     contact_force: ContactForceCallback
     external_force: ExternalForceCallback | None = None
+    converged: ConvergenceCallback | None = None
 
 
 @dataclass(frozen=True)
@@ -92,8 +95,12 @@ def run_coupled_time_iteration(
     displacement0: np.ndarray | None = None,
     velocity0: np.ndarray | None = None,
     acceleration0: np.ndarray | None = None,
+    displacement_history0: np.ndarray | None = None,
+    velocity_history0: np.ndarray | None = None,
+    acceleration_history0: np.ndarray | None = None,
     contact_force0: np.ndarray | None = None,
     settings: CoupledIterationSettings | None = None,
+    accepted_step_callback: Callable[[Any], None] | None = None,
 ) -> CoupledTimeIterationResult:
     """Run the coupled main loop with force convergence and step-size retry.
 
@@ -111,14 +118,34 @@ def run_coupled_time_iteration(
     if settings.min_dt > dt:
         raise ValueError("min_dt cannot exceed dt")
 
-    q0 = np.zeros(system.ndof, dtype=float) if displacement0 is None else _as_vector(displacement0, system.ndof)
-    v0 = np.zeros(system.ndof, dtype=float) if velocity0 is None else _as_vector(velocity0, system.ndof)
+    q_seed = _as_history_seed(displacement_history0, system.ndof)
+    v_seed = _as_history_seed(velocity_history0, system.ndof)
+    a_seed = _as_history_seed(acceleration_history0, system.ndof)
+    if (q_seed is None) != (v_seed is None) or (q_seed is None) != (a_seed is None):
+        raise ValueError("displacement, velocity, and acceleration history seeds must be supplied together")
+
+    q0 = (
+        q_seed[-1].copy()
+        if q_seed is not None
+        else np.zeros(system.ndof, dtype=float)
+        if displacement0 is None
+        else _as_vector(displacement0, system.ndof)
+    )
+    v0 = (
+        v_seed[-1].copy()
+        if v_seed is not None
+        else np.zeros(system.ndof, dtype=float)
+        if velocity0 is None
+        else _as_vector(velocity0, system.ndof)
+    )
     f_contact = (
         np.zeros(system.ndof, dtype=float) if contact_force0 is None else _as_vector(contact_force0, system.ndof)
     )
     f_ext0 = _external_force(callbacks.external_force, 0.0, system.ndof)
     a0 = (
-        _as_vector(acceleration0, system.ndof)
+        a_seed[-1].copy()
+        if a_seed is not None
+        else _as_vector(acceleration0, system.ndof)
         if acceleration0 is not None
         else initial_acceleration(system, q0, v0, f_ext0 + f_contact)
     )
@@ -133,6 +160,9 @@ def run_coupled_time_iteration(
     dt_history = [0.0]
     rail_history: list[Any] = [None]
     geometry_history: list[Any] = [None]
+    integration_q_history = [row.copy() for row in q_seed] if q_seed is not None else [q0]
+    integration_v_history = [row.copy() for row in v_seed] if v_seed is not None else [v0]
+    integration_a_history = [row.copy() for row in a_seed] if a_seed is not None else [a0]
 
     current_dt = float(dt)
     accepted_steps = 0
@@ -144,9 +174,9 @@ def run_coupled_time_iteration(
                 step_index=accepted_steps + 1,
                 time_next=time_history[-1] + current_dt,
                 dt=current_dt,
-                q_history=q_history,
-                v_history=v_history,
-                a_history=a_history,
+                q_history=integration_q_history,
+                v_history=integration_v_history,
+                a_history=integration_a_history,
                 previous_contact_force=contact_force_history[-1],
                 settings=settings,
             )
@@ -168,6 +198,11 @@ def run_coupled_time_iteration(
         dt_history.append(current_dt)
         rail_history.append(accepted.rail_response)
         geometry_history.append(accepted.contact_geometry)
+        integration_q_history.append(accepted.displacement)
+        integration_v_history.append(accepted.velocity)
+        integration_a_history.append(accepted.acceleration)
+        if accepted_step_callback is not None:
+            accepted_step_callback(accepted)
         accepted_steps += 1
         if settings.reset_dt_after_success:
             current_dt = float(dt)
@@ -188,6 +223,7 @@ def run_coupled_time_iteration(
 
 @dataclass(frozen=True)
 class _AcceptedStep:
+    step_index: int
     time: float
     displacement: np.ndarray
     velocity: np.ndarray
@@ -221,6 +257,7 @@ def _attempt_coupled_step(
     last_q = last_v = last_a = None
     last_rail = last_geometry = None
     last_contact = None
+    stepper = PreparedLinearStepper(system, dt=dt)
 
     for iteration in range(1, settings.max_iterations + 1):
         total_force = external + force_guess
@@ -231,6 +268,7 @@ def _attempt_coupled_step(
             a_history,
             total_force,
             dt,
+            stepper,
         )
         state = CoupledStepState(
             step_index=step_index,
@@ -250,8 +288,9 @@ def _attempt_coupled_step(
         last_rail, last_geometry = rail_response, contact_geometry
         last_contact = contact_force
 
-        if _force_converged(contact_force, force_guess, settings):
+        if _step_converged(callbacks, state, rail_response, contact_geometry, contact_force, force_guess, settings):
             return _AcceptedStep(
+                step_index=step_index,
                 time=time_next,
                 displacement=q_next,
                 velocity=v_next,
@@ -274,7 +313,12 @@ def _integrate_candidate(
     a_history: list[np.ndarray],
     total_force: np.ndarray,
     dt: float,
+    stepper: PreparedLinearStepper | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if stepper is not None:
+        if len(q_history) < 3:
+            return stepper.newmark_step(q_history[-1], v_history[-1], a_history[-1], total_force)
+        return stepper.park_step(np.vstack(q_history[-3:]), np.vstack(v_history[-3:]), total_force)
     if len(q_history) < 3:
         return newmark_step(system, q_history[-1], v_history[-1], a_history[-1], total_force, dt)
     return park_step(system, np.vstack(q_history[-3:]), np.vstack(v_history[-3:]), total_force, dt)
@@ -284,6 +328,20 @@ def _force_converged(contact_force: np.ndarray, force_guess: np.ndarray, setting
     delta = np.linalg.norm(contact_force - force_guess, ord=np.inf)
     scale = max(np.linalg.norm(contact_force, ord=np.inf), np.linalg.norm(force_guess, ord=np.inf), 1.0)
     return delta <= settings.absolute_force_tolerance or delta / scale <= settings.force_tolerance
+
+
+def _step_converged(
+    callbacks: CoupledStepCallbacks,
+    state: CoupledStepState,
+    rail_response: Any,
+    contact_geometry: Any,
+    contact_force: np.ndarray,
+    force_guess: np.ndarray,
+    settings: CoupledIterationSettings,
+) -> bool:
+    if callbacks.converged is not None:
+        return bool(callbacks.converged(state, rail_response, contact_geometry, contact_force, force_guess, settings))
+    return _force_converged(contact_force, force_guess, settings)
 
 
 def _external_force(callback: ExternalForceCallback | None, time: float, ndof: int) -> np.ndarray:
@@ -297,3 +355,12 @@ def _as_vector(value: np.ndarray, ndof: int) -> np.ndarray:
     if array.shape != (ndof,):
         raise ValueError(f"expected vector with shape ({ndof},), got {array.shape}")
     return array
+
+
+def _as_history_seed(value: np.ndarray | None, ndof: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=float)
+    if array.ndim != 2 or array.shape[1] != ndof or array.shape[0] < 1:
+        raise ValueError(f"expected history seed with shape (n, {ndof}), got {array.shape}")
+    return array.copy()

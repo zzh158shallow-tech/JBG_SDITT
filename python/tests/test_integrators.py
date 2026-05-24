@@ -5,6 +5,7 @@ import numpy as np
 from sditt.integrators import (
     LinearSecondOrderSystem,
     NewmarkCoefficients,
+    PreparedLinearStepper,
     initial_acceleration,
     integrate_park_newmark,
     newmark_step,
@@ -148,6 +149,44 @@ def test_integrator_accepts_assembled_vehicle_track_style_matrices() -> None:
     assert history.velocity.shape == (21, 4)
     assert history.acceleration.shape == (21, 4)
     assert np.all(np.isfinite(history.displacement))
+
+
+def test_prepared_stepper_matches_standalone_steps() -> None:
+    system = LinearSecondOrderSystem(
+        mass=np.array([[2.0, 0.0], [0.0, 3.0]]),
+        damping=np.array([[0.4, 0.0], [0.0, 0.6]]),
+        stiffness=np.array([[50.0, -5.0], [-5.0, 80.0]]),
+    )
+    stepper = PreparedLinearStepper(system, dt=0.005)
+    q0 = np.array([0.1, -0.02])
+    v0 = np.array([0.0, 0.01])
+    a0 = initial_acceleration(system, q0, v0, np.array([1.0, 0.5]))
+    p1 = np.array([1.5, -0.2])
+
+    assert np.allclose(stepper.newmark_step(q0, v0, a0, p1), newmark_step(system, q0, v0, a0, p1, 0.005))
+
+
+def test_sparse_linear_system_integrates_like_dense() -> None:
+    dense_system = LinearSecondOrderSystem(
+        mass=np.diag([2.0, 3.0]),
+        damping=np.diag([0.4, 0.5]),
+        stiffness=np.diag([50.0, 70.0]),
+    )
+    sparse_system = LinearSecondOrderSystem(
+        mass=dense_system.mass,
+        damping=dense_system.damping,
+        stiffness=dense_system.stiffness,
+        use_sparse=True,
+    )
+    force = np.array([1.0, -0.5])
+    kwargs = dict(force=force, displacement0=np.array([0.1, 0.0]), velocity0=np.zeros(2), dt=0.001, n_steps=20)
+
+    dense_history = integrate_park_newmark(dense_system, **kwargs)
+    sparse_history = integrate_park_newmark(sparse_system, **kwargs)
+
+    assert np.allclose(sparse_history.displacement, dense_history.displacement)
+    assert np.allclose(sparse_history.velocity, dense_history.velocity)
+    assert np.allclose(sparse_history.acceleration, dense_history.acceleration)
 
 
 def test_no_contact_forced_response_advances_qva_histories() -> None:

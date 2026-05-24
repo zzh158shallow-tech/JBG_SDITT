@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class ContactPatch:
     corrected_rail_point: np.ndarray
     wheel_profile_lateral: float
     peak_vertical_penetration: float
+    peak_normal_penetration: float
+    peak_contact_angle: float
     corrected_vertical_penetration: float
     corrected_normal_penetration: float
     contact_angle: float
@@ -84,6 +87,10 @@ def trace_wheel_profile(
     wheel_profile: np.ndarray,
     contact_angle_table: np.ndarray,
     pose: WheelPose2D | None = None,
+    *,
+    dlb: float | None = None,
+    discrete_len_flange: float = 0.5e-5,
+    discrete_len_tread: float = 2.5e-5,
 ) -> WheelTrace:
     """Transform a wheel profile into the track cross-section.
 
@@ -95,10 +102,17 @@ def trace_wheel_profile(
     pose = pose or WheelPose2D()
     profile = _sort_points(wheel_profile)
     angle_table = _sort_points(contact_angle_table)
+    if dlb is not None:
+        profile = _densify_wheel_profile_for_trace(
+            profile,
+            dlb=float(dlb),
+            discrete_len_flange=discrete_len_flange,
+            discrete_len_tread=discrete_len_tread,
+        )
 
     x_profile = profile[:, 0]
     rolling_radius = profile[:, 1]
-    contact_angles = np.interp(x_profile, angle_table[:, 0], angle_table[:, 1])
+    contact_angles = _spline_interp(angle_table[:, 0], angle_table[:, 1], x_profile)
 
     lx = -np.cos(pose.roll) * np.sin(pose.yaw)
     ly = np.cos(pose.roll) * np.cos(pose.yaw)
@@ -109,7 +123,9 @@ def trace_wheel_profile(
 
     x_base = x_profile * lx
     y_base = x_profile * ly + pose.lateral
-    z_base = x_profile * lz + pose.vertical
+    # MATLAB TracePrinciple.m leaves Zw_DW out of the traced wheel profile;
+    # vertical wheel motion is added later when forming Elastic_pen.
+    z_base = x_profile * lz
 
     x_track = x_base + lx * rolling_radius * tan_angle
     y_track = y_base - rolling_radius * (lx**2 * ly * tan_angle + lz * m_value) / denominator
@@ -128,6 +144,9 @@ def single_point_contact_geometry(
     *,
     pose: WheelPose2D | None = None,
     min_overlap_margin: float = 0.0,
+    dlb: float | None = None,
+    discrete_len_flange: float = 0.5e-5,
+    discrete_len_tread: float = 2.5e-5,
 ) -> SinglePointContact:
     """Compute the simplest single-point wheel/rail normal contact geometry.
 
@@ -137,7 +156,14 @@ def single_point_contact_geometry(
     same vertical coordinate convention used by the MATLAB migration.
     """
 
-    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose)
+    trace = trace_wheel_profile(
+        wheel_profile,
+        contact_angle_table,
+        pose,
+        dlb=dlb,
+        discrete_len_flange=discrete_len_flange,
+        discrete_len_tread=discrete_len_tread,
+    )
     rail = _sort_points(rail_profile)
     if trace.track_points.size == 0 or rail.size == 0:
         return _empty_contact()
@@ -155,8 +181,10 @@ def single_point_contact_geometry(
     wheel_points = trace.track_points[mask]
     wheel_lateral = trace.wheel_lateral[mask]
     contact_angles = trace.contact_angles[mask]
-    rail_z = np.interp(wheel_points[:, 1], rail[:, 0], rail[:, 1])
-    vertical_gap = rail_z - wheel_points[:, 2]
+    vertical_offset = 0.0 if pose is None else pose.vertical
+    rail_z = _matlab_rail_interp(rail, wheel_points[:, 1])
+    shifted_wheel_z = wheel_points[:, 2] + vertical_offset
+    vertical_gap = rail_z - shifted_wheel_z
     index = int(np.argmin(vertical_gap))
 
     gap = float(vertical_gap[index])
@@ -165,7 +193,7 @@ def single_point_contact_geometry(
     roll = 0.0 if pose is None else pose.roll
     normal_penetration = vertical_penetration / max(np.cos(contact_angle + roll), np.finfo(float).eps)
     rail_point = np.array([wheel_points[index, 1], rail_z[index]], dtype=float)
-    wheel_point = np.array([wheel_points[index, 1], wheel_points[index, 2]], dtype=float)
+    wheel_point = np.array([wheel_points[index, 1], shifted_wheel_z[index]], dtype=float)
     return SinglePointContact(
         has_contact=vertical_penetration > 0.0,
         rail_point=rail_point,
@@ -187,6 +215,7 @@ def multi_point_contact_geometry(
     penetration_offset: float = 0.0,
     min_overlap_margin: float = 0.0,
     correction_theta: float = 2e-5,
+    dlb: float | None = None,
 ) -> MultiPointContactGeometry:
     """Find all single-rail contact candidates and apply quasi-elastic correction.
 
@@ -196,7 +225,7 @@ def multi_point_contact_geometry(
     point to the weighted quasi-elastic center of its interval.
     """
 
-    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose)
+    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose, dlb=dlb)
     wheel_interp, rail_interp, angles, wheel_lateral = _overlap_interpolants(
         trace,
         rail_profile,
@@ -207,7 +236,10 @@ def multi_point_contact_geometry(
         boundaries = extreme_boundary(empty)
         return MultiPointContactGeometry(False, empty, wheel_interp, rail_interp, angles, wheel_lateral, boundaries, ())
 
-    elastic_penetration = np.column_stack((wheel_interp[:, 1], wheel_interp[:, 2] - rail_interp[:, 1] + penetration_offset))
+    vertical_offset = 0.0 if pose is None else pose.vertical
+    elastic_penetration = np.column_stack(
+        (wheel_interp[:, 1], wheel_interp[:, 2] - rail_interp[:, 1] + vertical_offset + penetration_offset)
+    )
     boundaries = extreme_boundary(elastic_penetration, opt="max")
     patches = quasi_elastic_correction(
         elastic_penetration,
@@ -218,6 +250,9 @@ def multi_point_contact_geometry(
         rail_interp,
         angles,
         wheel_lateral,
+        contact_angle_table=contact_angle_table,
+        yaw=0.0 if pose is None else pose.yaw,
+        lateral=0.0 if pose is None else pose.lateral,
         roll=0.0 if pose is None else pose.roll,
         theta=correction_theta,
     )
@@ -295,6 +330,9 @@ def quasi_elastic_correction(
     contact_angles: np.ndarray,
     wheel_profile_lateral: np.ndarray | None = None,
     *,
+    contact_angle_table: np.ndarray | None = None,
+    yaw: float = 0.0,
+    lateral: float = 0.0,
     roll: float = 0.0,
     theta: float = 2e-5,
 ) -> tuple[ContactPatch, ...]:
@@ -304,10 +342,22 @@ def quasi_elastic_correction(
         return ()
 
     elastic = _sort_points(elastic_penetration)
-    wheel = _sort_points_by_column(wheel_interp, 1)
+    wheel_raw = np.asarray(wheel_interp, dtype=float)
+    wheel_order = np.argsort(wheel_raw[:, 1], kind="mergesort") if wheel_raw.size else np.array([], dtype=int)
+    wheel = wheel_raw[wheel_order] if wheel_raw.size else wheel_raw.reshape(0, 3)
     rail = _sort_points(rail_interp)
-    angles = np.asarray(contact_angles, dtype=float)
-    wheel_lateral = np.asarray(wheel_profile_lateral, dtype=float) if wheel_profile_lateral is not None else wheel[:, 1]
+    angles_raw = np.asarray(contact_angles, dtype=float)
+    angles = angles_raw[wheel_order] if wheel_order.size else angles_raw
+    if wheel_profile_lateral is not None:
+        wheel_lateral_raw = np.asarray(wheel_profile_lateral, dtype=float)
+        wheel_lateral = wheel_lateral_raw[wheel_order] if wheel_order.size else wheel_lateral_raw
+    else:
+        wheel_lateral = wheel[:, 1]
+    if contact_angle_table is not None:
+        angle_profile = _sort_points(contact_angle_table)
+    else:
+        angle_profile = _sort_points(np.column_stack((wheel_lateral, angles)))
+    wheel_to_track = _wheelset_orientation(roll, yaw)
     patches: list[ContactPatch] = []
 
     for peak_row, start_row, end_row in zip(positive_peaks, positive_starts, positive_ends, strict=True):
@@ -329,8 +379,15 @@ def quasi_elastic_correction(
             dtype=float,
         )
         corrected_rail = np.array([center_y, np.interp(center_y, rail[:, 0], rail[:, 1])], dtype=float)
-        corrected_angle = float(np.interp(center_y, wheel[:, 1], angles))
+        corrected_local = _right_matrix_divide(
+            corrected_wheel[np.newaxis, :] - np.array([0.0, lateral, 0.0], dtype=float),
+            wheel_to_track,
+        )[0]
+        corrected_lateral = float(corrected_local[1])
+        corrected_angle = float(np.interp(corrected_lateral, angle_profile[:, 0], angle_profile[:, 1]))
         normal_penetration = corrected_penetration / max(np.cos(corrected_angle + roll), np.finfo(float).eps)
+        peak_angle = float(angles_raw[peak_index])
+        peak_normal_penetration = peak_penetration / max(np.cos(peak_angle + roll), np.finfo(float).eps)
 
         peak_wheel = wheel[peak_index, :]
         peak_rail = rail[peak_index, :]
@@ -343,8 +400,10 @@ def quasi_elastic_correction(
                 peak_rail_point=peak_rail.copy(),
                 corrected_wheel_point=corrected_wheel,
                 corrected_rail_point=corrected_rail,
-                wheel_profile_lateral=float(np.interp(center_y, wheel[:, 1], wheel_lateral)),
+                wheel_profile_lateral=corrected_lateral,
                 peak_vertical_penetration=peak_penetration,
+                peak_normal_penetration=float(peak_normal_penetration),
+                peak_contact_angle=peak_angle,
                 corrected_vertical_penetration=corrected_penetration,
                 corrected_normal_penetration=float(normal_penetration),
                 contact_angle=corrected_angle,
@@ -365,6 +424,67 @@ def _sort_points_by_column(points: np.ndarray, column: int) -> np.ndarray:
     if data.size == 0:
         return data.reshape(0, 3)
     return data[np.argsort(data[:, column])]
+
+
+def _wheelset_orientation(roll: float, yaw: float) -> np.ndarray:
+    return np.array(
+        [
+            [np.cos(yaw), np.sin(yaw), 0.0],
+            [-np.cos(roll) * np.sin(yaw), np.cos(roll) * np.cos(yaw), np.sin(roll)],
+            [np.sin(roll) * np.sin(yaw), -np.sin(roll) * np.cos(yaw), np.cos(roll)],
+        ],
+        dtype=float,
+    )
+
+
+def _right_matrix_divide(values: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    return np.linalg.solve(np.asarray(matrix, dtype=float).T, np.asarray(values, dtype=float).T).T
+
+
+def _densify_wheel_profile_for_trace(
+    profile: np.ndarray,
+    *,
+    dlb: float,
+    discrete_len_flange: float,
+    discrete_len_tread: float,
+) -> np.ndarray:
+    """Match MATLAB ``TracePrinciple.m`` wheel-profile resampling."""
+
+    x = profile[:, 0]
+    is_right = float(np.mean(x)) >= 0.0
+    if is_right:
+        flange = x <= dlb + 38e-3
+    else:
+        flange = x >= -(dlb + 38e-3)
+    if not np.any(flange) or np.all(flange):
+        dense_x = _matlab_colon(float(x[0]), discrete_len_tread, float(x[-1]))
+    else:
+        flange_x = _matlab_colon(float(np.min(x[flange])), discrete_len_flange, float(np.max(x[flange])))
+        tread_x = _matlab_colon(float(np.min(x[~flange])), discrete_len_tread, float(np.max(x[~flange])))
+        dense_x = np.sort(np.concatenate((flange_x, tread_x)))
+    dense_x = np.unique(dense_x)
+    radius = _spline_interp(profile[:, 0], profile[:, 1], dense_x)
+    return np.column_stack((dense_x, radius))
+
+
+def _matlab_colon(start: float, step: float, stop: float) -> np.ndarray:
+    if step <= 0.0:
+        raise ValueError("step must be positive")
+    if start > stop:
+        return np.empty((0,), dtype=float)
+    count = int(np.floor((stop - start) / step + 1e-12)) + 1
+    return start + step * np.arange(count, dtype=float)
+
+
+def _spline_interp(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+    order = np.argsort(x)
+    x_sorted = np.asarray(x, dtype=float)[order]
+    y_sorted = np.asarray(y, dtype=float)[order]
+    unique_x, unique_index = np.unique(x_sorted, return_index=True)
+    y_unique = y_sorted[unique_index]
+    if unique_x.size < 4:
+        return np.interp(x_new, unique_x, y_unique)
+    return CubicSpline(unique_x, y_unique)(x_new)
 
 
 def _overlap_interpolants(
@@ -406,9 +526,15 @@ def _overlap_interpolants(
     wheel = trace.track_points[mask][sort_index]
     angles = trace.contact_angles[mask][sort_index]
     wheel_lateral = trace.wheel_lateral[mask][sort_index]
-    rail_z = np.interp(wheel[:, 1], rail[:, 0], rail[:, 1])
+    rail_z = _matlab_rail_interp(rail, wheel[:, 1])
     rail_interp = np.column_stack((wheel[:, 1], rail_z))
     return wheel, rail_interp, angles, wheel_lateral
+
+
+def _matlab_rail_interp(rail: np.ndarray, y: np.ndarray) -> np.ndarray:
+    spline_z = _spline_interp(rail[:, 0], rail[:, 1], y)
+    linear_z = np.interp(y, rail[:, 0], rail[:, 1])
+    return np.where(spline_z > 0.6 + 8e-3, linear_z, spline_z)
 
 
 def _boundary_rows(data: np.ndarray, derivative: np.ndarray, indexes: np.ndarray) -> np.ndarray:

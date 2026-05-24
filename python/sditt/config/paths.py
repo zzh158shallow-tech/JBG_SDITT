@@ -28,6 +28,14 @@ class ProjectPaths:
         return self.matlab_dir / "Mat_FT_S8b.mat"
 
     @property
+    def rail_pro_mat(self) -> Path:
+        return self.matlab_dir / "RailPro.mat"
+
+    @property
+    def baseplate_pro_mat(self) -> Path:
+        return self.matlab_dir / "BaseplatePro.mat"
+
+    @property
     def default_vehicle_parameters(self) -> Path:
         return self.matlab_dir / "Par_Vehicle_CRH380A_v6.m"
 

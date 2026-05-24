@@ -23,10 +23,18 @@ from .geometry import (
     read_mileage_profile_file,
     wheel_curvature_radius,
 )
+from .selection import (
+    DefaultRailProfileSelector,
+    DummyRailProfiles,
+    build_default_07009_face_profile_selector,
+    rail_profile_numbers,
+)
 
 __all__ = [
     "BezierProfileData",
     "ContactTables",
+    "DefaultRailProfileSelector",
+    "DummyRailProfiles",
     "MileageProfileEntry",
     "OffsetProfileRecord",
     "ProfileData",
@@ -35,6 +43,7 @@ __all__ = [
     "TrackProfileSet",
     "WheelProfileSet",
     "build_track_profiles",
+    "build_default_07009_face_profile_selector",
     "build_wheel_profiles",
     "contact_angles",
     "contact_tables",
@@ -47,6 +56,7 @@ __all__ = [
     "load_profile_file",
     "offset_profile_to_track",
     "rail_curvature_radius",
+    "rail_profile_numbers",
     "read_mileage_profile_file",
     "wheel_curvature_radius",
 ]

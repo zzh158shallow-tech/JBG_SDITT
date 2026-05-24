@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class ForceShapeFunctionEntry:
+    shape_y: np.ndarray
+    shape_z: np.ndarray
+    row_y: np.ndarray
+    row_z: np.ndarray
 
 
 def wr_force_modal_ft(
@@ -39,6 +48,7 @@ def wr_force_modal_ft(
         rail: np.zeros((int(_field(_field(inp_par, "DOF_Node"), rail)), 1), dtype=float) for rail in type_rail
     }
     has_detailed_normal_force = _has_field(con_ws, "FF") and _has_field(_field(con_ws, "FF"), "Normal_Force")
+    shape_cache: dict[tuple[str, str], ForceShapeFunctionEntry] = {}
 
     for wheel in range(n_wheels):
         if int(xlcs) <= 3 and not has_detailed_normal_force:
@@ -54,6 +64,7 @@ def wr_force_modal_ft(
                     normal_z=float(pjcc[contact]),
                     creep=prhxf[contact, :],
                     shape_function=shape_function,
+                    shape_cache=shape_cache,
                 )
         else:
             con_str = _field(con_ws, exp_ws[wheel])
@@ -71,6 +82,7 @@ def wr_force_modal_ft(
                         normal_z=float(normal_force[k, 2]),
                         creep=prhxf_temp[k, :],
                         shape_function=shape_function,
+                        shape_cache=shape_cache,
                     )
 
     for rail in type_rail:
@@ -89,21 +101,36 @@ def _accumulate_physical_rail_force(
     normal_z: float,
     creep: np.ndarray,
     shape_function: Any,
+    shape_cache: dict[tuple[str, str], ForceShapeFunctionEntry],
 ) -> None:
     force_y = -(normal_y + float(creep[1]))
     force_z = -(normal_z + float(creep[2]))
-    shape_y = np.asarray(_field(shape_function, f"{wheelset_name}_{rail}_Y"), dtype=float).reshape(-1)
-    shape_z = np.asarray(_field(shape_function, f"{wheelset_name}_{rail}_Z"), dtype=float).reshape(-1)
-    row_y = _matlab_rows_to_python(_field(shape_function, f"{wheelset_name}_{rail}_Mapping_DynStatus_Y"))
-    row_z = _matlab_rows_to_python(_field(shape_function, f"{wheelset_name}_{rail}_Mapping_DynStatus_Z"))
+    shape = _shape_function_entry(shape_function, wheelset_name, rail, shape_cache)
 
-    if row_y.size != shape_y.size:
+    if shape.row_y.size != shape.shape_y.size:
         raise ValueError(f"{wheelset_name}_{rail}_Y and Mapping_DynStatus_Y lengths differ")
-    if row_z.size != shape_z.size:
+    if shape.row_z.size != shape.shape_z.size:
         raise ValueError(f"{wheelset_name}_{rail}_Z and Mapping_DynStatus_Z lengths differ")
 
-    pxt_track_rail[row_y, 0] += force_y * shape_y
-    pxt_track_rail[row_z, 0] += force_z * shape_z
+    pxt_track_rail[shape.row_y, 0] += force_y * shape.shape_y
+    pxt_track_rail[shape.row_z, 0] += force_z * shape.shape_z
+
+
+def _shape_function_entry(
+    shape_function: Any,
+    wheelset_name: str,
+    rail: str,
+    cache: dict[tuple[str, str], ForceShapeFunctionEntry],
+) -> ForceShapeFunctionEntry:
+    key = (wheelset_name, rail)
+    if key not in cache:
+        cache[key] = ForceShapeFunctionEntry(
+            shape_y=np.asarray(_field(shape_function, f"{wheelset_name}_{rail}_Y"), dtype=float).reshape(-1),
+            shape_z=np.asarray(_field(shape_function, f"{wheelset_name}_{rail}_Z"), dtype=float).reshape(-1),
+            row_y=_matlab_rows_to_python(_field(shape_function, f"{wheelset_name}_{rail}_Mapping_DynStatus_Y")),
+            row_z=_matlab_rows_to_python(_field(shape_function, f"{wheelset_name}_{rail}_Mapping_DynStatus_Z")),
+        )
+    return cache[key]
 
 
 def _legacy_contact_range(vehicle_dir: str) -> tuple[int, ...]:

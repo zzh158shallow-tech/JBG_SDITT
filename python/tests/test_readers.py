@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from sditt.config import ProjectPaths
+from sditt.config import MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths
 from sditt.io import inspect_raw_inputs, load_sditt_raw_inputs
 from sditt.io.text import load_numeric_text
 from sditt.profiles import (
+    build_default_07009_face_profile_selector,
     build_track_profiles,
     build_wheel_profiles,
     contact_tables,
@@ -14,9 +15,15 @@ from sditt.profiles import (
     interpolate_rail_profiles,
     load_profile_file,
     offset_profile_to_track,
+    rail_profile_numbers,
     read_mileage_profile_file,
 )
-from sditt.simulation import assemble_system_matrices, build_default_modal_rw_system_matrices
+from sditt.simulation import (
+    assemble_sparse_system_matrices,
+    assemble_system_matrices,
+    build_default_modal_rw_system_matrices,
+    build_default_sparse_modal_rw_system_matrices,
+)
 from sditt.track import (
     build_flexible_turnout_modal_matrices,
     build_modal_track_matrices,
@@ -84,6 +91,9 @@ def test_build_flexible_turnout_modal_matrices_low_cutoff() -> None:
     assert np.allclose(np.diag(matrices.K_track), omega**2)
     assert np.allclose(np.diag(matrices.C_track), 2 * matrices.DR[:, 1] * omega)
     assert np.isclose(matrices.mode_freq[0, 1], 47.754)
+    assert matrices.M_track_sparse.shape == matrices.M_track.shape
+    assert matrices.K_track_sparse.nnz == matrices.K_track.shape[0]
+    assert matrices.C_track_sparse.nnz == matrices.C_track.shape[0]
 
 
 def test_load_vehicle_parameters_from_matlab_script() -> None:
@@ -97,6 +107,13 @@ def test_load_vehicle_parameters_from_matlab_script() -> None:
     assert vehicle.values["C_DPz"].shape == (2, 1)
     assert vehicle.values["K_STy_Table"].shape == (13, 2)
     assert np.all(np.diff(vehicle.values["K_STy_Table"][:, 0]) >= 0)
+
+
+def test_default_operating_case_matches_matlab_straight_layout() -> None:
+    case = MATLAB_FULL_DEFAULT_CASE
+
+    assert case.layout_type == "Straight"
+    assert case.to_inp_par()["Type_Layout"] == "Straight"
 
 
 def test_build_vehicle_matrices_rw_230409() -> None:
@@ -151,6 +168,28 @@ def test_assemble_system_matrices_block_structure() -> None:
     assert np.count_nonzero(system.Mxt[:2, 2:]) == 0
     assert np.count_nonzero(system.Kxt[2:, :2]) == 0
     assert np.count_nonzero(system.Cxt[:2, 2:]) == 0
+    assert system.Mxt_sparse.shape == system.Mxt.shape
+
+
+def test_assemble_sparse_system_matrices_block_structure() -> None:
+    system = assemble_sparse_system_matrices(
+        np.eye(2),
+        np.diag([10.0, 20.0]),
+        np.diag([1.0, 2.0]),
+        np.diag([3.0, 4.0]),
+        np.diag([30.0, 40.0]),
+        np.diag([6.0, 7.0]),
+        nm_fw=0,
+        n_wheels=4,
+        n_rv=2,
+    )
+
+    assert system.layout.total_dof == 4
+    assert system.Mxt.shape == (4, 4)
+    assert system.Kxt.shape == (4, 4)
+    assert system.Cxt.shape == (4, 4)
+    assert np.allclose(system.Mxt.toarray()[:2, :2], np.eye(2))
+    assert np.allclose(system.Kxt.toarray()[2:, 2:], np.diag([30.0, 40.0]))
 
 
 def test_build_default_modal_rw_system_matrices_low_cutoff() -> None:
@@ -176,6 +215,62 @@ def test_build_default_modal_rw_system_matrices_low_cutoff() -> None:
         system.Cxt[system.layout.vehicle_block, system.layout.vehicle_block],
         vehicle.C_vehicle,
     )
+
+
+def test_build_default_sparse_modal_rw_system_matrices_low_cutoff() -> None:
+    system, track, vehicle = build_default_sparse_modal_rw_system_matrices(cut_freq=50.0)
+
+    assert system.layout.n_track == track.M_track_sparse.shape[0] == 5
+    assert system.layout.n_rv == 51
+    assert system.Mxt.shape == (56, 56)
+    assert system.Kxt.shape == (56, 56)
+    assert system.Cxt.shape == (56, 56)
+    assert np.allclose(system.Mxt[: system.layout.n_track, : system.layout.n_track].toarray(), track.M_track)
+    assert np.allclose(
+        system.Mxt[system.layout.vehicle_block, system.layout.vehicle_block].toarray(),
+        vehicle.M_vehicle,
+    )
+
+
+def test_matlab_full_default_operating_case_matches_main_script() -> None:
+    case = MATLAB_FULL_DEFAULT_CASE
+    inp_par = case.to_inp_par()
+
+    assert case.choose_turnout == "07(009)"
+    assert case.vehicle_direction == "Face"
+    assert case.speed_kmh == 350.0
+    assert np.isclose(case.vlc, 350 / 3.6)
+    assert case.track_type == "FT-Modal"
+    assert case.normal_contact_type == "STRIPES&ConDamp"
+    assert case.contact_damping == "Hu-Guo"
+    assert case.contact_damping_coefficient == 0.83
+    assert case.integration_method == "Park"
+    assert case.vehicle_type == "CRH380A_v6"
+    assert case.cut_freq_ft == 2000.0
+    assert case.n_rv == 51
+    assert case.n_contact_patch == 4
+
+    assert inp_par["Choose_Turnout"] == "07(009)"
+    assert inp_par["VehicleDir"] == "Face"
+    assert inp_par["Vlc"] == 350 / 3.6
+    assert inp_par["Type_Track"] == "FT-Modal"
+    assert inp_par["Type_Normal"] == "STRIPES&ConDamp"
+    assert inp_par["ConDamp"] == "Hu-Guo"
+    assert inp_par["ConDamp_Coff"] == 0.83
+    assert inp_par["N_RV"] == 51
+    assert inp_par["NM_FW"] == 0
+    assert inp_par["Nw"] == 4
+    assert inp_par["Exp_WS"] == ("FF", "FR", "RF", "RR")
+    assert inp_par["Exp_DummyRail"] == ("L1", "R1", "R2", "R3")
+    assert case.stage_inp_par("Preload")["Type_simulation"] == "Preload"
+    assert case.stage_inp_par("Cal")["Type_simulation"] == "Cal"
+
+
+def test_default_operating_case_trail_speed_sign() -> None:
+    case = DefaultOperatingCase(vehicle_direction="Trail")
+
+    assert np.isclose(case.vlc, -350 / 3.6)
+    assert case.to_inp_par()["Vlc"] == case.vlc
 
 
 def test_load_profile_text_file() -> None:
@@ -264,6 +359,21 @@ def test_bezier_profile_data_and_track_coordinate_offsets() -> None:
     assert np.allclose(offset.profile[:, 0], rail.profile[:, 0] + 1.435 / 2 + 0.01)
     assert np.allclose(offset.profile[:, 1], rail.profile[:, 1] + 0.62)
     assert np.array_equal(track.profile["R"], offset.profile)
+
+
+def test_default_07009_face_profile_selector_builds_matlab_style_records() -> None:
+    selector = build_default_07009_face_profile_selector(num_interp=128)
+    profiles = selector.select(54.0)
+    numbers = rail_profile_numbers(profiles)
+
+    assert set(profiles) == {"L1", "R1", "R2", "R3"}
+    assert numbers["L1"] == {"FF": 1, "FR": 1, "RF": 1, "RR": 1}
+    assert numbers["R1"]["FF"] == 22
+    assert numbers["R2"]["FF"] == 20
+    assert numbers["R3"]["FF"] is None
+    assert profiles["R1"].by_station["FF"].profile.shape == (128, 2)
+    assert profiles["R2"].by_station["FF"].front_profile.shape[1] == 2
+    assert profiles["R2"].by_station["FF"].radius.shape == (128, 2)
 
 
 def test_load_mileage_text_file() -> None:

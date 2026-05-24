@@ -158,11 +158,12 @@ def _add_rigid_wheel_force(
 ) -> None:
     sign = (-1.0) ** wheelside
     base = pos_rv + 5 * wheel
+    yaw_displacement = _state_value(zwy, base + 4)
     pxt[base + 0, 0] += normal_z
     pxt[base + 1, 0] += normal_y
     pxt[base + 2, 0] += normal_z * sign * br
     pxt[base + 2, 0] -= normal_y * radius
-    pxt[base + 4, 0] -= normal_y * br * zwy[base + 4, 3] * sign
+    pxt[base + 4, 0] -= normal_y * br * yaw_displacement * sign
 
     pxt[base + 0, 0] += creep[2]
     pxt[base + 1, 0] += creep[1]
@@ -171,7 +172,7 @@ def _add_rigid_wheel_force(
     pxt[base + 3, 0] += creep[0] * radius
     pxt[base + 3, 0] += creep[4]
     pxt[base + 4, 0] -= creep[0] * br * sign
-    pxt[base + 4, 0] -= creep[1] * br * zwy[base + 4, 3] * sign
+    pxt[base + 4, 0] -= creep[1] * br * yaw_displacement * sign
     pxt[base + 4, 0] += creep[5]
 
 
@@ -199,6 +200,17 @@ def _cell_value(cell: Any, index: int) -> Any:
 
 def _as_column(array: Any) -> np.ndarray:
     return np.asarray(array, dtype=float).reshape(-1)
+
+
+def _state_value(state: Any, index: int) -> float:
+    array = np.asarray(state, dtype=float)
+    if array.ndim == 1:
+        return float(array[index])
+    if array.ndim == 2 and array.shape[1] > 3:
+        return float(array[index, 3])
+    if array.ndim == 2 and array.shape[1] == 1:
+        return float(array[index, 0])
+    raise ValueError("state arrays must be vectors, single-column arrays, or MATLAB-style arrays with column 4")
 
 
 def _wheelside_number(side: str) -> int:
