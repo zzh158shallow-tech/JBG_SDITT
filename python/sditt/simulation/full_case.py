@@ -10,7 +10,9 @@ import numpy as np
 from sditt.contact import (
     DefaultTrackContactParameters,
     FullCaseWheelRailContactResult,
+    WheelPose2D,
     solve_default_wheel_rail_contact,
+    trace_wheel_profile,
 )
 from sditt.config import MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths, SimulationStage
 from sditt.integrators import LinearSecondOrderSystem
@@ -58,6 +60,25 @@ class MissingFullCaseStage:
 
 
 @dataclass(frozen=True)
+class FullCaseSideProfileSnapshot:
+    """One wheel/rail side cross-section payload for progress displays."""
+
+    side: str
+    wheel_profile: np.ndarray
+    rail_profile: np.ndarray
+    wheel_contact_points: np.ndarray
+    rail_contact_points: np.ndarray
+
+
+@dataclass(frozen=True)
+class FullCaseProfileSnapshot:
+    """Lightweight left/right cross-section profile payload for progress displays."""
+
+    wheelset: str
+    sides: dict[str, FullCaseSideProfileSnapshot]
+
+
+@dataclass(frozen=True)
 class FullCaseProgressEvent:
     stage: SimulationStage
     step_index: int
@@ -71,6 +92,10 @@ class FullCaseProgressEvent:
     contact_force_norm: float
     total_force_norm: float
     max_patch_force_z: float
+    patch_force_labels: tuple[str, ...] = ()
+    patch_force_magnitude: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
+    patch_vertical_force_z: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
+    profile_snapshot: FullCaseProfileSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -578,7 +603,15 @@ def _progress_callback(
         rail = accepted.rail_response
         geometry = accepted.contact_geometry
         contact = geometry.wheel_rail_contact if geometry is not None else None
-        patch_force_z = np.zeros((0,), dtype=float) if contact is None else -contact.prhxf[:, 2] - contact.pjcc[:, 0]
+        if contact is None:
+            patch_force_y = np.zeros((0,), dtype=float)
+            patch_force_z = np.zeros((0,), dtype=float)
+        else:
+            patch_force_y = -contact.prhxf[:, 1] - contact.pjch[:, 0]
+            patch_force_z = -contact.prhxf[:, 2] - contact.pjcc[:, 0]
+        patch_force_magnitude = np.hypot(patch_force_y, patch_force_z)
+        patch_force_labels = _progress_patch_force_labels(preparation.stage_inp_par[stage])
+        profile_snapshot = _progress_profile_snapshot(preparation, stage, accepted, contact)
         callback(
             FullCaseProgressEvent(
                 stage=stage,
@@ -593,10 +626,162 @@ def _progress_callback(
                 contact_force_norm=float(np.linalg.norm(accepted.contact_force)),
                 total_force_norm=float(np.linalg.norm(accepted.total_force)),
                 max_patch_force_z=float(np.max(np.abs(patch_force_z), initial=0.0)),
+                patch_force_labels=patch_force_labels,
+                patch_force_magnitude=np.asarray(patch_force_magnitude, dtype=float).copy(),
+                patch_vertical_force_z=np.asarray(patch_force_z, dtype=float).copy(),
+                profile_snapshot=profile_snapshot,
             )
         )
 
     return emit
+
+
+def _progress_patch_force_labels(inp_par: Mapping[str, object]) -> tuple[str, ...]:
+    wheelsets = tuple(str(wheelset) for wheelset in inp_par.get("Exp_WS", ()))
+    dummy_rails = tuple(str(dummy_rail) for dummy_rail in inp_par.get("Exp_DummyRail", ()))
+    return tuple(f"{wheelset}-{dummy_rail}" for wheelset in wheelsets for dummy_rail in dummy_rails)
+
+
+def _progress_profile_snapshot(
+    preparation: FullDefaultCasePreparation,
+    stage: SimulationStage,
+    accepted: Any,
+    contact: FullCaseWheelRailContactResult | None,
+) -> FullCaseProfileSnapshot | None:
+    if contact is None:
+        return None
+
+    selection = _progress_profile_selection(contact)
+    if selection is None:
+        return None
+    wheelset, wheel_index = selection
+
+    inp_par = preparation.stage_inp_par[stage]
+    pose = _progress_wheel_pose(np.asarray(accepted.displacement, dtype=float), inp_par, wheel_index)
+    d0 = float(contact.d0_by_wheelset.get(wheelset, 0.0))
+
+    track_profile = contact.track_profiles.get(wheelset)
+    if track_profile is None:
+        return None
+
+    con_ws = contact.con_ws.get(wheelset, {}) if isinstance(contact.con_ws, dict) else {}
+    sides: dict[str, FullCaseSideProfileSnapshot] = {}
+    for side in ("L", "R"):
+        if side == "L":
+            wheel_profile_source = preparation.wheel_profiles.left
+            angle_source = preparation.wheel_profiles.contact_angle_left
+        else:
+            wheel_profile_source = preparation.wheel_profiles.right
+            angle_source = preparation.wheel_profiles.contact_angle_right
+
+        trace = trace_wheel_profile(
+            wheel_profile_source,
+            angle_source,
+            pose,
+            dlb=float(preparation.vehicle_parameters.values.get("Dlb", 0.0)),
+        )
+        wheel_profile = trace.track_points[:, 1:3].copy()
+        wheel_profile[:, 1] += pose.vertical + d0
+        rail_profile = np.asarray(track_profile.profile.get(side, np.zeros((0, 2), dtype=float)), dtype=float)
+        if wheel_profile.size == 0 or rail_profile.size == 0:
+            continue
+
+        wheel_contacts = _progress_wheel_contact_points(con_ws, side, pose, d0)
+        rail_contacts = _progress_side_array(con_ws, "Con_rail_1", side, columns=2)
+        contact_count = min(wheel_contacts.shape[0], rail_contacts.shape[0])
+        sides[side] = FullCaseSideProfileSnapshot(
+            side=side,
+            wheel_profile=_decimate_profile(wheel_profile),
+            rail_profile=_decimate_profile(rail_profile),
+            wheel_contact_points=wheel_contacts[:contact_count, :],
+            rail_contact_points=rail_contacts[:contact_count, :],
+        )
+
+    if not sides:
+        return None
+    return FullCaseProfileSnapshot(wheelset=wheelset, sides=sides)
+
+
+def _progress_profile_selection(contact: FullCaseWheelRailContactResult) -> tuple[str, int] | None:
+    wheelsets = [wheelset for wheelset in contact.track_profiles if wheelset in contact.con_ws]
+    if "FF" in wheelsets:
+        return "FF", wheelsets.index("FF")
+
+    candidates: list[tuple[float, str, int]] = []
+    for wheel_index, wheelset in enumerate(wheelsets):
+        con_ws = contact.con_ws.get(wheelset, {})
+        if not isinstance(con_ws, dict):
+            continue
+        wheelset_force = 0.0
+        for side in ("L", "R"):
+            normal_force = _progress_side_array(con_ws, "Normal_Force", side, columns=4)
+            wheelset_force = max(wheelset_force, float(np.max(np.abs(normal_force[:, 0]), initial=0.0)))
+        candidates.append((wheelset_force, wheelset, wheel_index))
+    if not candidates:
+        return None
+    _, wheelset, wheel_index = max(candidates, key=lambda item: item[0])
+    return wheelset, wheel_index
+
+
+def _progress_wheel_pose(displacement: np.ndarray, inp_par: Mapping[str, Any], wheel_index: int) -> WheelPose2D:
+    base = int(inp_par["N_track"]) + int(inp_par["NM_FW"]) * int(inp_par["Nw"]) + 5 * wheel_index
+    return WheelPose2D(
+        lateral=_progress_state_value(displacement, base + 1),
+        vertical=_progress_state_value(displacement, base + 0),
+        roll=_progress_state_value(displacement, base + 2),
+        yaw=_progress_state_value(displacement, base + 4),
+    )
+
+
+def _progress_state_value(state: np.ndarray, index: int) -> float:
+    if state.ndim == 1:
+        return float(state[index])
+    if state.ndim == 2 and state.shape[1] > 3:
+        return float(state[index, 3])
+    if state.ndim == 2 and state.shape[1] == 1:
+        return float(state[index, 0])
+    raise ValueError("state arrays must be vectors, single-column arrays, or MATLAB-style arrays with column 4")
+
+
+def _progress_wheel_contact_points(con_ws: Mapping[str, Any], side: str, pose: WheelPose2D, d0: float) -> np.ndarray:
+    local = _progress_side_array(con_ws, "Con_wheel_2_full", side, columns=3)
+    if local.size == 0:
+        local = _progress_side_array(con_ws, "Con_wheel_2", side, columns=3)
+    if local.size == 0:
+        return np.zeros((0, 2), dtype=float)
+    orientation = _progress_wheelset_orientation(pose.roll, pose.yaw)
+    track = local[:, :3] @ orientation + np.array([0.0, pose.lateral, 0.0], dtype=float)
+    points = track[:, 1:3].copy()
+    points[:, 1] += pose.vertical + d0
+    return points
+
+
+def _progress_side_array(con_ws: Mapping[str, Any], key: str, side: str, *, columns: int) -> np.ndarray:
+    container = con_ws.get(key, {}) if isinstance(con_ws, Mapping) else {}
+    value = container.get(side, np.zeros((0, columns), dtype=float)) if isinstance(container, Mapping) else container
+    array = np.asarray(value, dtype=float)
+    if array.size == 0:
+        return np.zeros((0, columns), dtype=float)
+    return array.reshape((-1, array.shape[-1]))[:, :columns]
+
+
+def _progress_wheelset_orientation(roll: float, yaw: float) -> np.ndarray:
+    return np.array(
+        [
+            [np.cos(yaw), np.sin(yaw), 0.0],
+            [-np.cos(roll) * np.sin(yaw), np.cos(roll) * np.cos(yaw), np.sin(roll)],
+            [np.sin(roll) * np.sin(yaw), -np.sin(roll) * np.cos(yaw), np.cos(roll)],
+        ],
+        dtype=float,
+    )
+
+
+def _decimate_profile(profile: np.ndarray, *, max_points: int = 600) -> np.ndarray:
+    points = np.asarray(profile, dtype=float)
+    if points.shape[0] <= max_points:
+        return points.copy()
+    indexes = np.linspace(0, points.shape[0] - 1, max_points).astype(int)
+    return points[indexes, :].copy()
 
 
 def _park_stage_seed(history: np.ndarray) -> np.ndarray:

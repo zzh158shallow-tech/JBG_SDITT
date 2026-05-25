@@ -13,6 +13,8 @@ import numpy as np
 
 from sditt.simulation import (
     FullCaseProgressEvent,
+    FullCaseProfileSnapshot,
+    FullCaseSideProfileSnapshot,
     FullDefaultCaseRunResult,
     FullDefaultCaseSettings,
     run_default_full_case_driver,
@@ -22,6 +24,24 @@ from sditt.simulation import (
 DEFAULT_OUTPUT_DIR = Path("python/outputs/full_case_short_run")
 DEFAULT_ABS_TOLERANCE = 1.0e-6
 DEFAULT_REL_TOLERANCE = 1.0e-4
+_PATCH_FORCE_COLORS = (
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+    "#4c78a8",
+    "#f58518",
+    "#54a24b",
+    "#e45756",
+    "#72b7b2",
+    "#b279a2",
+)
 
 
 @dataclass(frozen=True)
@@ -623,16 +643,21 @@ class _ProgressRecorder:
         csv_path = output_dir / "progress.csv"
         svg_path = output_dir / "progress_final.svg"
         events = self.snapshot()
+        patch_labels = _patch_force_labels(events)
+        patch_columns = ",".join(_patch_force_column(label) for label in patch_labels)
+        patch_suffix = f",{patch_columns}" if patch_columns else ""
         with csv_path.open("w", encoding="utf-8") as handle:
             handle.write(
                 "stage,step,n_steps,time,dt,front_mileage,iterations,"
-                "contact_force_norm,total_force_norm,max_patch_force_z\n"
+                f"contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}\n"
             )
             for event in events:
+                patch_values = _patch_force_values(event, len(patch_labels), fallback_max=len(patch_labels) == 1)
+                patch_text = "".join(f",{value:.17g}" for value in patch_values)
                 handle.write(
                     f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
                     f"{event.front_mileage:.17g},{event.iterations},{event.contact_force_norm:.17g},"
-                    f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}\n"
+                    f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}{patch_text}\n"
                 )
         svg_path.write_text(self.svg(events), encoding="utf-8")
         return csv_path, svg_path
@@ -642,25 +667,30 @@ class _ProgressRecorder:
         return self._svg(event_list)
 
     def csv_text(self) -> str:
+        events = self.snapshot()
+        patch_labels = _patch_force_labels(events)
+        patch_columns = ",".join(_patch_force_column(label) for label in patch_labels)
+        patch_suffix = f",{patch_columns}" if patch_columns else ""
         lines = [
-            "stage,step,n_steps,time,dt,front_mileage,iterations,contact_force_norm,total_force_norm,max_patch_force_z"
+            f"stage,step,n_steps,time,dt,front_mileage,iterations,contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}"
         ]
-        for event in self.snapshot():
+        for event in events:
+            patch_values = _patch_force_values(event, len(patch_labels), fallback_max=len(patch_labels) == 1)
+            patch_text = "".join(f",{value:.17g}" for value in patch_values)
             lines.append(
                 f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
                 f"{event.front_mileage:.17g},{event.iterations},{event.contact_force_norm:.17g},"
-                f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}"
+                f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}{patch_text}"
             )
         return "\n".join(lines) + "\n"
 
     def _svg(self, events: list[FullCaseProgressEvent]) -> str:
-        width = 980
+        width = 1120
         height = 520
         margin_left = 70
-        margin_right = 25
+        margin_right = 205
         plot_top = 50
-        plot_gap = 60
-        plot_height = 170
+        plot_height = 360
         plot_width = width - margin_left - margin_right
         if not events:
             return (
@@ -670,8 +700,8 @@ class _ProgressRecorder:
                 "SDITT full-case progress</text></svg>"
             )
         xs = np.asarray([event.front_mileage for event in events], dtype=float)
-        force = np.asarray([event.contact_force_norm for event in events], dtype=float) / 1000.0
-        patch = np.asarray([event.max_patch_force_z for event in events], dtype=float) / 1000.0
+        patch_labels, patch_indices = _display_patch_force_selection(events)
+        patch_forces = _patch_force_matrix(events, patch_labels, patch_indices)
         stages = [event.stage for event in events]
         parts = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
@@ -679,29 +709,17 @@ class _ProgressRecorder:
             '<text x="24" y="28" font-family="Arial" font-size="18" fill="#202020">SDITT full-case progress</text>',
         ]
         parts.extend(
-            self._plot(
+            self._plot_multi(
                 xs,
-                force,
+                patch_forces,
+                patch_labels,
                 stages,
                 x=margin_left,
                 y=plot_top,
                 width=plot_width,
                 height=plot_height,
-                title="Contact force norm",
-                y_label="Contact force norm (kN)",
-            )
-        )
-        parts.extend(
-            self._plot(
-                xs,
-                patch,
-                stages,
-                x=margin_left,
-                y=plot_top + plot_height + plot_gap,
-                width=plot_width,
-                height=plot_height,
-                title="Max patch vertical force",
-                y_label="Max patch vertical force (kN)",
+                title="Patch wheel-rail force magnitude",
+                y_label="Patch force magnitude (kN)",
             )
         )
         last = events[-1]
@@ -712,6 +730,74 @@ class _ProgressRecorder:
         )
         parts.append("</svg>")
         return "\n".join(parts)
+
+    def _plot_multi(
+        self,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        labels: tuple[str, ...],
+        stages: list[str],
+        *,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        title: str,
+        y_label: str,
+    ) -> list[str]:
+        x0, x1 = _plot_range(xs)
+        y0, y1 = _plot_range(ys)
+        x_ticks = _plot_ticks(x0, x1)
+        y_ticks = _plot_ticks(y0, y1)
+        stage_lines = []
+        seen_stage_changes: set[tuple[str, int]] = set()
+        previous_stage = stages[0]
+        for index, stage in enumerate(stages):
+            if index == 0 or stage == previous_stage:
+                previous_stage = stage
+                continue
+            key = (stage, index)
+            if key in seen_stage_changes:
+                continue
+            seen_stage_changes.add(key)
+            px = x + (float(xs[index]) - x0) / (x1 - x0) * width
+            stage_lines.append(f'<line x1="{px:.3f}" y1="{y}" x2="{px:.3f}" y2="{y + height}" stroke="#8a8a8a" stroke-dasharray="4 4"/>')
+            stage_lines.append(f'<text x="{px + 6:.3f}" y="{y + 16}" font-family="Arial" font-size="12" fill="#555">{stage}</text>')
+            previous_stage = stage
+        tick_lines: list[str] = []
+        for tick in x_ticks:
+            px = x + (tick - x0) / (x1 - x0) * width
+            tick_lines.append(f'<line x1="{px:.3f}" y1="{y + height}" x2="{px:.3f}" y2="{y + height + 5}" stroke="#444"/>')
+            tick_lines.append(f'<text x="{px:.3f}" y="{y + height + 20}" font-family="Arial" font-size="11" fill="#444" text-anchor="middle">{tick:.3g}</text>')
+        for tick in y_ticks:
+            py = y + height - (tick - y0) / (y1 - y0) * height
+            tick_lines.append(f'<line x1="{x - 5}" y1="{py:.3f}" x2="{x}" y2="{py:.3f}" stroke="#444"/>')
+            tick_lines.append(f'<text x="{x - 8}" y="{py + 4:.3f}" font-family="Arial" font-size="11" fill="#444" text-anchor="end">{tick:.3g}</text>')
+        series_parts: list[str] = []
+        for series_index, label in enumerate(labels):
+            color = _PATCH_FORCE_COLORS[series_index % len(_PATCH_FORCE_COLORS)]
+            for segment in _plot_series_segments(xs, ys[:, series_index], x0=x0, x1=x1, y0=y0, y1=y1, x=x, y=y, width=width, height=height):
+                if len(segment) == 1:
+                    px, py = segment[0]
+                    series_parts.append(f'<circle cx="{px:.3f}" cy="{py:.3f}" r="3" fill="{color}"/>')
+                else:
+                    points = " ".join(f"{px:.3f},{py:.3f}" for px, py in segment)
+                    series_parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="1.7"/>')
+            legend_y = y + 8 + series_index * 18
+            legend_x = x + width + 18
+            series_parts.append(f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 18}" y2="{legend_y}" stroke="{color}" stroke-width="2"/>')
+            series_parts.append(f'<text x="{legend_x + 24}" y="{legend_y + 4}" font-family="Arial" font-size="11" fill="#333">{label}</text>')
+        return [
+            f'<text x="{x}" y="{y - 14}" font-family="Arial" font-size="15" fill="#202020">{title}</text>',
+            f'<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="#f8f8f8" stroke="#c8c8c8"/>',
+            f'<line x1="{x}" y1="{y + height}" x2="{x + width}" y2="{y + height}" stroke="#444"/>',
+            f'<line x1="{x}" y1="{y}" x2="{x}" y2="{y + height}" stroke="#444"/>',
+            *tick_lines,
+            *series_parts,
+            *stage_lines,
+            f'<text x="{x + width / 2:.3f}" y="{y + height + 42}" font-family="Arial" font-size="12" fill="#202020" text-anchor="middle">Mileage (m)</text>',
+            f'<text x="{x - 50}" y="{y + height / 2:.3f}" font-family="Arial" font-size="12" fill="#202020" text-anchor="middle" transform="rotate(-90 {x - 50} {y + height / 2:.3f})">{y_label}</text>',
+        ]
 
     def _plot(
         self,
@@ -772,6 +858,105 @@ class _ProgressRecorder:
         ]
 
 
+def _patch_force_labels(events: Iterable[FullCaseProgressEvent]) -> tuple[str, ...]:
+    event_list = tuple(events)
+    for event in event_list:
+        if event.patch_force_labels:
+            return tuple(str(label) for label in event.patch_force_labels)
+    patch_count = max(
+        (
+            max(
+                np.asarray(event.patch_force_magnitude, dtype=float).size,
+                np.asarray(event.patch_vertical_force_z, dtype=float).size,
+            )
+            for event in event_list
+        ),
+        default=0,
+    )
+    if patch_count > 0:
+        return tuple(f"patch-{index + 1}" for index in range(patch_count))
+    return ("max-patch",) if event_list else ()
+
+
+def _patch_force_column(label: str) -> str:
+    safe = "".join(character if character.isalnum() else "_" for character in label).strip("_")
+    return f"patch_{safe}_wheel_rail_force_magnitude_N"
+
+
+def _patch_force_values(event: FullCaseProgressEvent, count: int, *, fallback_max: bool = False) -> np.ndarray:
+    values = np.full((count,), np.nan, dtype=float)
+    patch_force = np.asarray(event.patch_force_magnitude, dtype=float).reshape(-1)
+    if patch_force.size == 0:
+        patch_force = np.abs(np.asarray(event.patch_vertical_force_z, dtype=float).reshape(-1))
+    if patch_force.size == 0 and fallback_max and count:
+        patch_force = np.asarray([event.max_patch_force_z], dtype=float)
+    copied = min(count, patch_force.size)
+    if copied:
+        values[:copied] = patch_force[:copied]
+    return values
+
+
+def _display_patch_force_selection(events: Iterable[FullCaseProgressEvent]) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    labels = _patch_force_labels(events)
+    if not labels:
+        return (), ()
+    first_label = labels[0]
+    if "-" not in first_label:
+        return labels, tuple(range(len(labels)))
+    first_wheelset = first_label.split("-", 1)[0]
+    indexes = tuple(index for index, label in enumerate(labels) if label.split("-", 1)[0] == first_wheelset)
+    if not indexes:
+        return labels, tuple(range(len(labels)))
+    return tuple(labels[index] for index in indexes), indexes
+
+
+def _patch_force_matrix(
+    events: Iterable[FullCaseProgressEvent],
+    labels: tuple[str, ...],
+    indices: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    event_list = tuple(events)
+    matrix = np.full((len(event_list), len(labels)), np.nan, dtype=float)
+    fallback_max = len(labels) == 1 and labels[0] == "max-patch"
+    source_count = max(indices, default=len(labels) - 1) + 1 if indices is not None else len(labels)
+    for row, event in enumerate(event_list):
+        values = _patch_force_values(event, source_count, fallback_max=fallback_max)
+        if indices is None:
+            matrix[row, :] = values[: len(labels)] / 1000.0
+        else:
+            matrix[row, :] = values[np.asarray(indices, dtype=int)] / 1000.0
+    return matrix
+
+
+def _plot_series_segments(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    *,
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> list[list[tuple[float, float]]]:
+    segments: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+    for x_value, y_value in zip(xs, ys, strict=True):
+        if not np.isfinite(x_value) or not np.isfinite(y_value):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        px = x + (float(x_value) - x0) / (x1 - x0) * width
+        py = y + height - (float(y_value) - y0) / (y1 - y0) * height
+        current.append((px, py))
+    if current:
+        segments.append(current)
+    return segments
+
+
 def _plot_range(values: np.ndarray) -> tuple[float, float]:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -787,6 +972,13 @@ def _plot_range(values: np.ndarray) -> tuple[float, float]:
 
 def _plot_ticks(low: float, high: float, count: int = 5) -> np.ndarray:
     return np.linspace(low, high, count)
+
+
+def _profile_points(value: Any) -> np.ndarray:
+    array = np.asarray(value, dtype=float)
+    if array.size == 0:
+        return np.zeros((0, 2), dtype=float)
+    return array.reshape((-1, array.shape[-1]))[:, :2]
 
 
 class _LiveProgressWindow:
@@ -810,6 +1002,9 @@ class _LiveProgressWindow:
         self.canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.status = ttk.Label(self.root, text="Close hides the window; the simulation keeps running.", anchor="w")
         self.status.pack(fill="x", padx=12, pady=(0, 10))
+        self._latest_events: tuple[FullCaseProgressEvent, ...] = ()
+        self._resize_after_id: str | None = None
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
 
     def run(self) -> None:
@@ -849,41 +1044,118 @@ class _LiveProgressWindow:
         self.root.after(500, self._refresh)
 
     def _draw(self, events: tuple[FullCaseProgressEvent, ...]) -> None:
+        self._latest_events = events
         self.canvas.delete("all")
-        width = max(int(self.canvas.winfo_width()), 900)
-        height = max(int(self.canvas.winfo_height()), 520)
+        width = max(int(self.canvas.winfo_width()), 420)
+        height = max(int(self.canvas.winfo_height()), 360)
         margin_left = 70
-        margin_right = 30
+        legend_width = 240 if width >= 820 else 0
+        margin_right = 30 + legend_width
         plot_top = 45
-        plot_gap = 65
-        plot_height = max(150, (height - 130) // 2)
-        plot_width = width - margin_left - margin_right
+        compact = height < 560
+        profile_gap = 42 if compact else 60
+        available_height = max(220, height - plot_top - 28)
+        plot_height = max(115, min(250, int(available_height * 0.42)))
+        profile_height = max(60, available_height - plot_height - profile_gap)
+        plot_width = max(220, width - margin_left - margin_right)
         xs = np.asarray([event.front_mileage for event in events], dtype=float)
-        force = np.asarray([event.contact_force_norm for event in events], dtype=float) / 1000.0
-        patch = np.asarray([event.max_patch_force_z for event in events], dtype=float) / 1000.0
+        patch_labels, patch_indices = _display_patch_force_selection(events)
+        patch_forces = _patch_force_matrix(events, patch_labels, patch_indices)
         stages = [event.stage for event in events]
-        self._draw_plot(
+        self._draw_multi_plot(
             xs,
-            force,
+            patch_forces,
+            patch_labels,
             stages,
             x=margin_left,
             y=plot_top,
             width=plot_width,
             height=plot_height,
-            title="Contact force norm",
-            y_label="Contact force norm (kN)",
+            title="Patch wheel-rail force magnitude",
+            y_label="Patch force magnitude (kN)",
+            show_legend=legend_width > 0,
         )
-        self._draw_plot(
-            xs,
-            patch,
-            stages,
+        self._draw_profile_panel(
+            events[-1].profile_snapshot,
             x=margin_left,
-            y=plot_top + plot_height + plot_gap,
+            y=plot_top + plot_height + profile_gap,
             width=plot_width,
-            height=plot_height,
-            title="Max patch vertical force",
-            y_label="Max patch vertical force (kN)",
+            height=profile_height,
         )
+
+    def _on_canvas_resize(self, _event: Any) -> None:
+        if not self._latest_events:
+            return
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(60, self._redraw_after_resize)
+
+    def _redraw_after_resize(self) -> None:
+        self._resize_after_id = None
+        if self._latest_events:
+            self._draw(self._latest_events)
+
+    def _draw_multi_plot(
+        self,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        labels: tuple[str, ...],
+        stages: list[str],
+        *,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        title: str,
+        y_label: str,
+        show_legend: bool,
+    ) -> None:
+        x0, x1 = _plot_range(xs)
+        y0, y1 = _plot_range(ys)
+        x_ticks = _plot_ticks(x0, x1)
+        y_ticks = _plot_ticks(y0, y1)
+        self.canvas.create_text(x, y - 18, text=title, anchor="w", font=("Arial", 14), fill="#202020")
+        self.canvas.create_rectangle(x, y, x + width, y + height, fill="#f8f8f8", outline="#c8c8c8")
+        self.canvas.create_line(x, y + height, x + width, y + height, fill="#444444")
+        self.canvas.create_line(x, y, x, y + height, fill="#444444")
+        for tick in x_ticks:
+            px = x + (float(tick) - x0) / (x1 - x0) * width
+            self.canvas.create_line(px, y + height, px, y + height + 5, fill="#444444")
+            self.canvas.create_text(px, y + height + 18, text=f"{tick:.3g}", anchor="n", font=("Arial", 10), fill="#444444")
+        for tick in y_ticks:
+            py = y + height - (float(tick) - y0) / (y1 - y0) * height
+            self.canvas.create_line(x - 5, py, x, py, fill="#444444")
+            self.canvas.create_text(x - 8, py, text=f"{tick:.3g}", anchor="e", font=("Arial", 10), fill="#444444")
+        self.canvas.create_text(x + width / 2, y + height + 38, text="Mileage (m)", anchor="n", font=("Arial", 11), fill="#202020")
+        self.canvas.create_text(x - 52, y + height / 2, text=y_label, anchor="center", angle=90, font=("Arial", 11), fill="#202020")
+        for series_index, label in enumerate(labels):
+            color = _PATCH_FORCE_COLORS[series_index % len(_PATCH_FORCE_COLORS)]
+            for segment in _plot_series_segments(xs, ys[:, series_index], x0=x0, x1=x1, y0=y0, y1=y1, x=x, y=y, width=width, height=height):
+                points: list[float] = []
+                for px, py in segment:
+                    points.extend([px, py])
+                if len(points) >= 4:
+                    self.canvas.create_line(*points, fill=color, width=2)
+                elif len(points) == 2:
+                    self.canvas.create_oval(points[0] - 3, points[1] - 3, points[0] + 3, points[1] + 3, fill=color, outline="")
+            if show_legend:
+                row_spacing = 14
+                rows = max(1, int((height - 8) / row_spacing))
+                row = series_index % rows
+                column = series_index // rows
+                legend_y = y + 8 + row * row_spacing
+                legend_x = x + width + 16 + column * 76
+                self.canvas.create_line(legend_x, legend_y, legend_x + 14, legend_y, fill=color, width=2)
+                self.canvas.create_text(legend_x + 19, legend_y, text=label, anchor="w", font=("Arial", 9), fill="#333333")
+        previous_stage = stages[0] if stages else ""
+        for index, stage in enumerate(stages):
+            if index == 0 or stage == previous_stage:
+                previous_stage = stage
+                continue
+            px = x + (float(xs[index]) - x0) / (x1 - x0) * width
+            self.canvas.create_line(px, y, px, y + height, fill="#8a8a8a", dash=(4, 4))
+            self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=("Arial", 11), fill="#555555")
+            previous_stage = stage
 
     def _draw_plot(
         self,
@@ -934,6 +1206,154 @@ class _LiveProgressWindow:
             self.canvas.create_line(px, y, px, y + height, fill="#8a8a8a", dash=(4, 4))
             self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=("Arial", 11), fill="#555555")
             previous_stage = stage
+
+    def _draw_profile_panel(
+        self,
+        snapshot: FullCaseProfileSnapshot | None,
+        *,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> None:
+        self.canvas.create_text(
+            x,
+            y - 18,
+            text="Wheel/Rail profile contact",
+            anchor="w",
+            font=("Arial", 14),
+            fill="#202020",
+        )
+        self.canvas.create_rectangle(x, y, x + width, y + height, fill="#fbfbfb", outline="#c8c8c8")
+        if snapshot is None:
+            self.canvas.create_text(
+                x + width / 2,
+                y + height / 2,
+                text="Waiting for contact profile data...",
+                anchor="center",
+                font=("Arial", 12),
+                fill="#666666",
+            )
+            return
+
+        column_gap = max(18, int(width * 0.035))
+        column_width = max(120, int((width - column_gap) / 2))
+        self._draw_side_profile_panel(
+            snapshot.sides.get("L"),
+            label=f"Left {snapshot.wheelset}",
+            x=x,
+            y=y,
+            width=column_width,
+            height=height,
+        )
+        self._draw_side_profile_panel(
+            snapshot.sides.get("R"),
+            label=f"Right {snapshot.wheelset}",
+            x=x + column_width + column_gap,
+            y=y,
+            width=max(120, width - column_width - column_gap),
+            height=height,
+        )
+
+    def _draw_side_profile_panel(
+        self,
+        side_snapshot: FullCaseSideProfileSnapshot | None,
+        *,
+        label: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> None:
+        self.canvas.create_rectangle(x, y, x + width, y + height, fill="#fbfbfb", outline="#dddddd")
+        self.canvas.create_text(x + 8, y + 8, text=label, anchor="nw", font=("Arial", 11), fill="#404040")
+        if side_snapshot is None:
+            self.canvas.create_text(
+                x + width / 2,
+                y + height / 2,
+                text="No profile",
+                anchor="center",
+                font=("Arial", 11),
+                fill="#777777",
+            )
+            return
+
+        wheel = _profile_points(side_snapshot.wheel_profile)
+        rail = _profile_points(side_snapshot.rail_profile)
+        wheel_contacts = _profile_points(side_snapshot.wheel_contact_points)
+        rail_contacts = _profile_points(side_snapshot.rail_contact_points)
+        if wheel.size == 0 or rail.size == 0:
+            return
+
+        padding_x = 18
+        top_padding = max(24, min(36, int(height * 0.16)))
+        bottom_padding = max(8, min(20, int(height * 0.10)))
+        band_gap = max(10, min(22, int(height * 0.11)))
+        band_height = max(20, int((height - top_padding - bottom_padding - band_gap) / 2))
+        wheel_y = y + top_padding
+        rail_y = wheel_y + band_height + band_gap
+
+        x_values = np.concatenate(
+            [
+                wheel[:, 0],
+                rail[:, 0],
+                wheel_contacts[:, 0] if wheel_contacts.size else np.zeros((0,), dtype=float),
+                rail_contacts[:, 0] if rail_contacts.size else np.zeros((0,), dtype=float),
+            ]
+        )
+        x0, x1 = _plot_range(x_values)
+        wheel_z0, wheel_z1 = _plot_range(wheel[:, 1])
+        rail_z0, rail_z1 = _plot_range(rail[:, 1])
+
+        def px(value: float) -> float:
+            return x + padding_x + (float(value) - x0) / (x1 - x0) * max(1, width - 2 * padding_x)
+
+        def py(value: float, z0: float, z1: float, band_y: int) -> float:
+            return band_y + (float(value) - z0) / (z1 - z0) * band_height
+
+        self.canvas.create_text(x + 8, wheel_y, text="Wheel", anchor="sw", font=("Arial", 10), fill="#555555")
+        self.canvas.create_text(x + 8, rail_y, text="Rail", anchor="sw", font=("Arial", 10), fill="#555555")
+
+        self._draw_profile_polyline(
+            wheel,
+            px=px,
+            py=lambda value: py(value, wheel_z0, wheel_z1, wheel_y),
+            fill="#d95f02",
+            width=2,
+        )
+        self._draw_profile_polyline(
+            rail,
+            px=px,
+            py=lambda value: py(value, rail_z0, rail_z1, rail_y),
+            fill="#1b9e77",
+            width=2,
+        )
+
+        contact_count = min(wheel_contacts.shape[0], rail_contacts.shape[0])
+        for index in range(contact_count):
+            wx = px(wheel_contacts[index, 0])
+            wy = py(wheel_contacts[index, 1], wheel_z0, wheel_z1, wheel_y)
+            rx = px(rail_contacts[index, 0])
+            ry = py(rail_contacts[index, 1], rail_z0, rail_z1, rail_y)
+            self.canvas.create_line(wx, wy, rx, ry, fill="#4c78a8", width=1, dash=(3, 3))
+            self.canvas.create_oval(wx - 3, wy - 3, wx + 3, wy + 3, fill="#d95f02", outline="")
+            self.canvas.create_oval(rx - 3, ry - 3, rx + 3, ry + 3, fill="#1b9e77", outline="")
+
+    def _draw_profile_polyline(
+        self,
+        points: np.ndarray,
+        *,
+        px: Any,
+        py: Any,
+        fill: str,
+        width: int,
+    ) -> None:
+        line_points: list[float] = []
+        finite = points[np.all(np.isfinite(points), axis=1)]
+        for lateral, vertical in finite:
+            line_points.extend([px(float(lateral)), py(float(vertical))])
+        if len(line_points) >= 4:
+            self.canvas.create_line(*line_points, fill=fill, width=width, smooth=True)
 
 
 def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -> int:

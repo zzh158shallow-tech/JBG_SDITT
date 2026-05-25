@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from sditt.contact.full_case import _creepage_inputs, _wheel_pose, _wheel_rate
+from sditt.simulation.full_case import _progress_profile_selection
 
 
 def test_rigid_wheelset_pose_and_rate_follow_matlab_dof_layout() -> None:
@@ -84,3 +85,30 @@ def test_creepage_inputs_include_rigid_wheel_kinematics_and_r2_rail_beam_velocit
     assert np.allclose(vjd_r, expected_vjd_r)
     assert np.allclose(vsdc, expected_vsdc)
     assert np.allclose(vjsdc, expected_vjsdc)
+
+
+def test_progress_profile_selection_prefers_front_wheelset_for_stable_live_display() -> None:
+    contact = SimpleNamespace(
+        track_profiles={"FF": object(), "FR": object(), "RF": object(), "RR": object()},
+        con_ws={
+            "FF": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.zeros((0, 4))}},
+            "FR": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.array([[10.0, 0.0, 0.0, 2.0]])}},
+            "RF": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.array([[20.0, 0.0, 0.0, 3.0]])}},
+            "RR": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.array([[30.0, 0.0, 0.0, 4.0]])}},
+        },
+    )
+
+    assert _progress_profile_selection(contact) == ("FF", 0)
+
+
+def test_progress_profile_selection_fallback_keeps_actual_wheelset_index() -> None:
+    contact = SimpleNamespace(
+        track_profiles={"FR": object(), "RF": object(), "RR": object()},
+        con_ws={
+            "FR": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.array([[10.0, 0.0, 0.0, 2.0]])}},
+            "RF": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.array([[30.0, 0.0, 0.0, 3.0]])}},
+            "RR": {"Normal_Force": {"L": np.zeros((0, 4)), "R": np.array([[20.0, 0.0, 0.0, 4.0]])}},
+        },
+    )
+
+    assert _progress_profile_selection(contact) == ("RF", 1)

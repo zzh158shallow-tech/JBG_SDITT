@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+
 from sditt.simulation import FullCaseProgressEvent
 from sditt.validation.full_case_short_run import (
     _ProgressRecorder,
@@ -99,6 +101,9 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
             contact_force_norm=1000.0,
             total_force_norm=2000.0,
             max_patch_force_z=300.0,
+            patch_force_labels=("FF-L1", "FF-R1", "FR-L1", "FR-R1"),
+            patch_force_magnitude=np.asarray([130.0, 250.0, 410.0, 510.0], dtype=float),
+            patch_vertical_force_z=np.asarray([120.0, -240.0, 400.0, 500.0], dtype=float),
         )
     )
     recorder(
@@ -115,6 +120,9 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
             contact_force_norm=1100.0,
             total_force_norm=2100.0,
             max_patch_force_z=330.0,
+            patch_force_labels=("FF-L1", "FF-R1", "FR-L1", "FR-R1"),
+            patch_force_magnitude=np.asarray([160.0, 340.0, 420.0, 520.0], dtype=float),
+            patch_vertical_force_z=np.asarray([150.0, -330.0, 410.0, 510.0], dtype=float),
         )
     )
 
@@ -124,12 +132,21 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
     assert svg_path.name == "progress_final.svg"
     assert csv_path.exists()
     assert svg_path.exists()
-    assert "Preload,1,2" in csv_path.read_text(encoding="utf-8")
+    csv = csv_path.read_text(encoding="utf-8")
+    assert (
+        "patch_FF_L1_wheel_rail_force_magnitude_N,patch_FF_R1_wheel_rail_force_magnitude_N,"
+        "patch_FR_L1_wheel_rail_force_magnitude_N,patch_FR_R1_wheel_rail_force_magnitude_N"
+    ) in csv
+    assert "Preload,1,2" in csv
+    assert ",130,250,410,510" in csv
     svg = svg_path.read_text(encoding="utf-8")
     assert "<polyline" in svg
     assert "Mileage (m)" in svg
-    assert "Contact force norm (kN)" in svg
-    assert "Max patch vertical force (kN)" in svg
+    assert "Patch force magnitude (kN)" in svg
+    assert "FF-L1" in svg
+    assert "FF-R1" in svg
+    assert "FR-L1" not in svg
+    assert "FR-R1" not in svg
     assert not (tmp_path / "progress_latest.svg").exists()
     assert not list(tmp_path.glob("preload_*.svg"))
     assert not list(tmp_path.glob("cal_*.svg"))
