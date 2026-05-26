@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import pickle
+import time
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -96,6 +100,8 @@ class FullCaseProgressEvent:
     patch_force_magnitude: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
     patch_vertical_force_z: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
     profile_snapshot: FullCaseProfileSnapshot | None = None
+    timing: Mapping[str, float] = field(default_factory=dict)
+    step_wall_time: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,7 @@ class FullDefaultCaseSettings:
     fail_on_missing_physics: bool = False
     progress_callback: Callable[[FullCaseProgressEvent], None] | None = None
     frozen_contact_input: "FullCaseFrozenContactInput | None" = None
+    preload_cache_dir: str | Path | None = None
     iteration_settings: CoupledIterationSettings = CoupledIterationSettings(
         max_iterations=30,
         force_tolerance=1.0e-3,
@@ -341,6 +348,8 @@ class FullDefaultCaseRunResult:
 
     preparation: FullDefaultCasePreparation
     stages: tuple[FullDefaultCaseStageResult, ...]
+    preload_cache_status: str = "disabled"
+    preload_cache_path: Path | None = None
 
     @property
     def is_physical_complete(self) -> bool:
@@ -357,6 +366,116 @@ class FullDefaultCaseRunResult:
 
 class MissingFullCasePhysicsError(RuntimeError):
     """Raised when a strict full-case run is requested before migration is complete."""
+
+
+_PRELOAD_CACHE_VERSION = 1
+
+
+def _preload_cache_path(preparation: FullDefaultCasePreparation) -> Path | None:
+    cache_dir = preparation.settings.preload_cache_dir
+    if cache_dir is None:
+        return None
+    key = _preload_cache_key(preparation)
+    return Path(cache_dir) / f"preload_{key}.pkl"
+
+
+def _preload_cache_key(preparation: FullDefaultCasePreparation) -> str:
+    fingerprint = _preload_cache_fingerprint(preparation)
+    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _preload_cache_fingerprint(preparation: FullDefaultCasePreparation) -> dict[str, Any]:
+    settings = preparation.settings
+    operating_case = preparation.operating_case
+    paths = preparation.paths
+    return {
+        "version": _PRELOAD_CACHE_VERSION,
+        "operating_case": asdict(operating_case),
+        "settings": {
+            "cut_freq": settings.cut_freq,
+            "dt": settings.dt,
+            "n_steps_per_stage": settings.n_steps_per_stage,
+            "stage_end_mileage": {str(key): value for key, value in (settings.stage_end_mileage or {}).items()},
+            "use_matlab_mileage_endpoints": settings.use_matlab_mileage_endpoints,
+            "use_sparse": settings.use_sparse,
+            "iteration_settings": asdict(settings.iteration_settings),
+        },
+        "input_files": {
+            "modal_turnout_mat": _file_fingerprint(paths.modal_turnout_mat),
+            "rail_pro_mat": _file_fingerprint(paths.rail_pro_mat),
+            "baseplate_pro_mat": _file_fingerprint(paths.baseplate_pro_mat),
+            "vehicle_parameters": _file_fingerprint(paths.default_vehicle_parameters),
+        },
+        "stage_end_mileage": _stage_end_mileage(preparation, "Preload"),
+        "total_dof": preparation.total_dof,
+        "n_track": preparation.system.layout.n_track,
+    }
+
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _load_preload_cache(preparation: FullDefaultCasePreparation, cache_path: Path) -> dict[str, Any] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception:
+        return None
+    if payload.get("fingerprint") != _preload_cache_fingerprint(preparation):
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _write_preload_cache(
+    preparation: FullDefaultCasePreparation,
+    cache_path: Path,
+    *,
+    displacement: np.ndarray,
+    velocity: np.ndarray,
+    acceleration: np.ndarray,
+    contact_force: np.ndarray,
+    stage_start_front_mileage: float,
+    contact_state: FullCaseContactState | None,
+    displacement_history_seed: np.ndarray | None,
+    velocity_history_seed: np.ndarray | None,
+    acceleration_history_seed: np.ndarray | None,
+    preload_events: tuple[FullCaseProgressEvent, ...] = (),
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fingerprint": _preload_cache_fingerprint(preparation),
+        "data": {
+            "displacement": displacement.copy(),
+            "velocity": velocity.copy(),
+            "acceleration": acceleration.copy(),
+            "contact_force": contact_force.copy(),
+            "stage_start_front_mileage": float(stage_start_front_mileage),
+            "contact_state": _clone_contact_state(contact_state),
+            "displacement_history_seed": _copy_cached_array(displacement_history_seed),
+            "velocity_history_seed": _copy_cached_array(velocity_history_seed),
+            "acceleration_history_seed": _copy_cached_array(acceleration_history_seed),
+            "preload_events": tuple(preload_events),
+        },
+    }
+    with cache_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _copy_cached_array(value: np.ndarray | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    return np.asarray(value, dtype=float).copy()
 
 
 def prepare_default_full_case(
@@ -485,8 +604,30 @@ def run_default_full_case_driver(
     displacement_history_seed: np.ndarray | None = None
     velocity_history_seed: np.ndarray | None = None
     acceleration_history_seed: np.ndarray | None = None
+    preload_cache_path = _preload_cache_path(preparation)
+    preload_cache_status = "disabled" if preload_cache_path is None else "miss"
+    stages_to_run = tuple(preparation.operating_case.simulation_stages)
+    preload_progress_events: list[FullCaseProgressEvent] = []
+    if preload_cache_path is not None and preparation.settings.frozen_contact_input is None:
+        cached = _load_preload_cache(preparation, preload_cache_path)
+        if cached is not None:
+            preload_cache_status = "hit"
+            displacement = cached["displacement"].copy()
+            velocity = cached["velocity"].copy()
+            acceleration = cached["acceleration"].copy()
+            contact_force = cached["contact_force"].copy()
+            stage_start_front_mileage = float(cached["stage_start_front_mileage"])
+            contact_state = _clone_contact_state(cached["contact_state"])
+            displacement_history_seed = _copy_cached_array(cached["displacement_history_seed"])
+            velocity_history_seed = _copy_cached_array(cached["velocity_history_seed"])
+            acceleration_history_seed = _copy_cached_array(cached["acceleration_history_seed"])
+            if preparation.settings.progress_callback is not None:
+                for event in tuple(cached.get("preload_events", ())):
+                    preparation.settings.progress_callback(event)
+            stages_to_run = tuple(stage for stage in stages_to_run if stage != "Preload")
 
-    for stage in preparation.operating_case.simulation_stages:
+    for stage in stages_to_run:
+        stage_wall_start = time.perf_counter()
         callbacks, build_stage_storage, extract_contact_state = _diagnostic_callbacks(
             preparation,
             stage,
@@ -502,6 +643,11 @@ def run_default_full_case_driver(
             contact_state,
         )
         stage_steps = _stage_step_count(preparation, stage, stage_start_front_mileage)
+        progress_mirror = (
+            preload_progress_events.append
+            if stage == "Preload" and preload_cache_path is not None and preparation.settings.frozen_contact_input is None
+            else None
+        )
         history = run_coupled_time_iteration(
             dynamics_system,
             callbacks,
@@ -515,7 +661,13 @@ def run_default_full_case_driver(
             acceleration_history0=acceleration_history_seed,
             contact_force0=contact_force,
             settings=preparation.settings.iteration_settings,
-            accepted_step_callback=_progress_callback(preparation, stage, stage_steps, build_stage_storage),
+            accepted_step_callback=_progress_callback(
+                preparation,
+                stage,
+                stage_steps,
+                build_stage_storage,
+                extra_callback=progress_mirror,
+            ),
         )
         iteration_records, output_rows = build_stage_storage(history)
         contact_state = extract_contact_state(history)
@@ -540,10 +692,31 @@ def run_default_full_case_driver(
             displacement_history_seed = None
             velocity_history_seed = None
             acceleration_history_seed = None
+        history_timing = dict(history.timing)
+        history_timing["stage_wall_time"] = time.perf_counter() - stage_wall_start
+        object.__setattr__(history, "timing", history_timing)
+        if stage == "Preload" and preload_cache_path is not None and preparation.settings.frozen_contact_input is None:
+            _write_preload_cache(
+                preparation,
+                preload_cache_path,
+                displacement=displacement,
+                velocity=velocity,
+                acceleration=acceleration,
+                contact_force=contact_force,
+                stage_start_front_mileage=stage_start_front_mileage,
+                contact_state=contact_state,
+                displacement_history_seed=displacement_history_seed,
+                velocity_history_seed=velocity_history_seed,
+                acceleration_history_seed=acceleration_history_seed,
+                preload_events=tuple(preload_progress_events),
+            )
+            preload_cache_status = "saved"
 
     return FullDefaultCaseRunResult(
         preparation=preparation,
         stages=tuple(stages),
+        preload_cache_status=preload_cache_status,
+        preload_cache_path=preload_cache_path,
     )
 
 
@@ -593,10 +766,12 @@ def _progress_callback(
     stage: SimulationStage,
     stage_steps: int,
     build_stage_storage: Callable[[CoupledTimeIterationResult], Any],
+    *,
+    extra_callback: Callable[[FullCaseProgressEvent], None] | None = None,
 ) -> Callable[[Any], None] | None:
     del build_stage_storage
     callback = preparation.settings.progress_callback
-    if callback is None:
+    if callback is None and extra_callback is None:
         return None
 
     def emit(accepted: Any) -> None:
@@ -612,26 +787,30 @@ def _progress_callback(
         patch_force_magnitude = np.hypot(patch_force_y, patch_force_z)
         patch_force_labels = _progress_patch_force_labels(preparation.stage_inp_par[stage])
         profile_snapshot = _progress_profile_snapshot(preparation, stage, accepted, contact)
-        callback(
-            FullCaseProgressEvent(
-                stage=stage,
-                step_index=int(getattr(accepted, "step_index", 0) or 0),
-                n_steps=stage_steps,
-                time=float(accepted.time),
-                dt=float(preparation.settings.dt),
-                front_mileage=float(rail.front_mileage),
-                iterations=int(accepted.iterations),
-                normal_error=float("nan"),
-                normal_tangential_error=float("nan"),
-                contact_force_norm=float(np.linalg.norm(accepted.contact_force)),
-                total_force_norm=float(np.linalg.norm(accepted.total_force)),
-                max_patch_force_z=float(np.max(np.abs(patch_force_z), initial=0.0)),
-                patch_force_labels=patch_force_labels,
-                patch_force_magnitude=np.asarray(patch_force_magnitude, dtype=float).copy(),
-                patch_vertical_force_z=np.asarray(patch_force_z, dtype=float).copy(),
-                profile_snapshot=profile_snapshot,
-            )
+        event = FullCaseProgressEvent(
+            stage=stage,
+            step_index=int(getattr(accepted, "step_index", 0) or 0),
+            n_steps=stage_steps,
+            time=float(accepted.time),
+            dt=float(preparation.settings.dt),
+            front_mileage=float(rail.front_mileage),
+            iterations=int(accepted.iterations),
+            normal_error=float("nan"),
+            normal_tangential_error=float("nan"),
+            contact_force_norm=float(np.linalg.norm(accepted.contact_force)),
+            total_force_norm=float(np.linalg.norm(accepted.total_force)),
+            max_patch_force_z=float(np.max(np.abs(patch_force_z), initial=0.0)),
+            patch_force_labels=patch_force_labels,
+            patch_force_magnitude=np.asarray(patch_force_magnitude, dtype=float).copy(),
+            patch_vertical_force_z=np.asarray(patch_force_z, dtype=float).copy(),
+            profile_snapshot=profile_snapshot,
+            timing=dict(getattr(accepted, "timing", {}) or {}),
+            step_wall_time=float(getattr(accepted, "step_wall_time", 0.0) or 0.0),
         )
+        if callback is not None:
+            callback(event)
+        if extra_callback is not None:
+            extra_callback(event)
 
     return emit
 

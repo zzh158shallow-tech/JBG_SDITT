@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -84,6 +85,7 @@ class CoupledTimeIterationResult:
     dt: np.ndarray
     rail_response: tuple[Any, ...]
     contact_geometry: tuple[Any, ...]
+    timing: Mapping[str, float] = field(default_factory=dict)
 
 
 def run_coupled_time_iteration(
@@ -165,8 +167,16 @@ def run_coupled_time_iteration(
     integration_a_history = [row.copy() for row in a_seed] if a_seed is not None else [a0]
 
     current_dt = float(dt)
+    stepper_cache: dict[float, PreparedLinearStepper] = {}
+    timing: dict[str, float] = {}
     accepted_steps = 0
     while accepted_steps < n_steps:
+        stepper = stepper_cache.get(current_dt)
+        if stepper is None:
+            start = time.perf_counter()
+            stepper = PreparedLinearStepper(system, dt=current_dt)
+            _add_timing(timing, "linear_stepper_setup", start)
+            stepper_cache[current_dt] = stepper
         try:
             accepted = _attempt_coupled_step(
                 system,
@@ -179,6 +189,8 @@ def run_coupled_time_iteration(
                 a_history=integration_a_history,
                 previous_contact_force=contact_force_history[-1],
                 settings=settings,
+                stepper=stepper,
+                timing=timing,
             )
         except _StepDidNotConverge:
             current_dt *= settings.shrink_factor
@@ -218,6 +230,7 @@ def run_coupled_time_iteration(
         dt=np.asarray(dt_history, dtype=float),
         rail_response=tuple(rail_history),
         contact_geometry=tuple(geometry_history),
+        timing=dict(timing),
     )
 
 
@@ -233,6 +246,8 @@ class _AcceptedStep:
     iterations: int
     rail_response: Any
     contact_geometry: Any
+    timing: Mapping[str, float] = field(default_factory=dict)
+    step_wall_time: float = 0.0
 
 
 class _StepDidNotConverge(Exception):
@@ -251,16 +266,20 @@ def _attempt_coupled_step(
     a_history: list[np.ndarray],
     previous_contact_force: np.ndarray,
     settings: CoupledIterationSettings,
+    stepper: PreparedLinearStepper | None = None,
+    timing: dict[str, float] | None = None,
 ) -> _AcceptedStep:
+    step_wall_start = time.perf_counter()
     force_guess = previous_contact_force.copy()
     external = _external_force(callbacks.external_force, time_next, system.ndof)
     last_q = last_v = last_a = None
     last_rail = last_geometry = None
     last_contact = None
-    stepper = PreparedLinearStepper(system, dt=dt)
+    stepper = stepper or PreparedLinearStepper(system, dt=dt)
 
     for iteration in range(1, settings.max_iterations + 1):
         total_force = external + force_guess
+        start = time.perf_counter()
         q_next, v_next, a_next = _integrate_candidate(
             system,
             q_history,
@@ -270,6 +289,7 @@ def _attempt_coupled_step(
             dt,
             stepper,
         )
+        _add_timing(timing, "integrate_candidate", start)
         state = CoupledStepState(
             step_index=step_index,
             iteration=iteration,
@@ -280,15 +300,24 @@ def _attempt_coupled_step(
             acceleration=a_next,
             force_guess=force_guess,
         )
+        start = time.perf_counter()
         rail_response = callbacks.recover_track_response(state)
+        _add_timing(timing, "recover_track_response", start)
+        start = time.perf_counter()
         contact_geometry = callbacks.contact_geometry(state, rail_response)
+        _add_timing(timing, "contact_geometry", start)
+        start = time.perf_counter()
         contact_force = _as_vector(callbacks.contact_force(state, rail_response, contact_geometry), system.ndof)
+        _add_timing(timing, "contact_force", start)
 
         last_q, last_v, last_a = q_next, v_next, a_next
         last_rail, last_geometry = rail_response, contact_geometry
         last_contact = contact_force
 
-        if _step_converged(callbacks, state, rail_response, contact_geometry, contact_force, force_guess, settings):
+        start = time.perf_counter()
+        converged = _step_converged(callbacks, state, rail_response, contact_geometry, contact_force, force_guess, settings)
+        _add_timing(timing, "convergence_check", start)
+        if converged:
             return _AcceptedStep(
                 step_index=step_index,
                 time=time_next,
@@ -300,10 +329,18 @@ def _attempt_coupled_step(
                 iterations=iteration,
                 rail_response=rail_response,
                 contact_geometry=contact_geometry,
+                timing=dict(timing or {}),
+                step_wall_time=time.perf_counter() - step_wall_start,
             )
         force_guess = (1.0 - settings.relaxation) * force_guess + settings.relaxation * contact_force
 
     raise _StepDidNotConverge()
+
+
+def _add_timing(timing: dict[str, float] | None, name: str, start: float) -> None:
+    if timing is None:
+        return
+    timing[name] = timing.get(name, 0.0) + (time.perf_counter() - start)
 
 
 def _integrate_candidate(

@@ -4,6 +4,7 @@ import argparse
 import json
 import queue
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,7 @@ def build_python_short_run_snapshot(
     n_steps_per_stage: int = 1,
     use_sparse: bool = True,
     use_matlab_mileage_endpoints: bool = False,
+    preload_cache_dir: str | Path | None = None,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
@@ -74,6 +76,7 @@ def build_python_short_run_snapshot(
         n_steps_per_stage=n_steps_per_stage,
         use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
         use_sparse=use_sparse,
+        preload_cache_dir=preload_cache_dir,
         progress_callback=progress_callback,
     )
     result = run_default_full_case_driver(settings=settings)
@@ -91,6 +94,13 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "n_steps_per_stage": preparation.settings.n_steps_per_stage,
             "use_matlab_mileage_endpoints": preparation.settings.use_matlab_mileage_endpoints,
             "use_sparse": preparation.settings.use_sparse,
+            "preload_cache_dir": None
+            if preparation.settings.preload_cache_dir is None
+            else str(preparation.settings.preload_cache_dir),
+        },
+        "preload_cache": {
+            "status": result.preload_cache_status,
+            "path": None if result.preload_cache_path is None else str(result.preload_cache_path),
         },
         "preparation": {
             "total_dof": preparation.total_dof,
@@ -99,6 +109,7 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "missing_stages": [stage.name for stage in preparation.missing_stages],
         },
         "stages": [_stage_snapshot(stage) for stage in result.stages],
+        "timing": _timing_snapshot(result),
     }
 
 
@@ -113,6 +124,7 @@ def write_full_case_short_run_report(
     plot_progress: bool = False,
     plot_every: int = 1,
     save_progress: bool = False,
+    preload_cache_dir: str | Path | None = None,
     progress_recorder: "_ProgressRecorder | None" = None,
     matlab_baseline_path: str | Path | None = None,
     abs_tolerance: float = DEFAULT_ABS_TOLERANCE,
@@ -131,6 +143,7 @@ def write_full_case_short_run_report(
         n_steps_per_stage=n_steps_per_stage,
         use_sparse=use_sparse,
         use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
+        preload_cache_dir=preload_cache_dir,
         progress_callback=progress_writer,
     )
     snapshot_path = output_path / "python_snapshot.json"
@@ -150,6 +163,7 @@ def write_full_case_short_run_report(
     report_path.write_text(markdown, encoding="utf-8")
     if progress_writer is not None and (plot_progress or save_progress):
         progress_writer.write_outputs(output_path / "progress")
+    write_timing_summary(python_snapshot, output_path / "timing")
     return snapshot_path, report_path
 
 
@@ -291,7 +305,54 @@ def _stage_snapshot(stage: Any) -> dict[str, Any]:
         "iteration_diagnostics": [_iteration_snapshot(record) for record in stage.iteration_records],
         "output_table": _array_payload(stage.output_table),
         "output_rows": [_output_row_snapshot(row) for row in stage.output_rows],
+        "timing": {str(key): float(value) for key, value in getattr(stage.history, "timing", {}).items()},
     }
+
+
+def _timing_snapshot(result: FullDefaultCaseRunResult) -> dict[str, Any]:
+    stages = []
+    totals: dict[str, float] = {}
+    for stage in result.stages:
+        timing = {str(key): float(value) for key, value in getattr(stage.history, "timing", {}).items()}
+        for key, value in timing.items():
+            totals[key] = totals.get(key, 0.0) + value
+        stages.append({"name": stage.stage, "timing": timing})
+    return {"stages": stages, "total": totals}
+
+
+def write_timing_summary(snapshot: dict[str, Any], output_dir: str | Path) -> tuple[Path, Path]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    rows: list[tuple[str, str, float]] = []
+    timing = snapshot.get("timing", {})
+    for stage in timing.get("stages", []):
+        stage_name = str(stage.get("name", ""))
+        for name, seconds in stage.get("timing", {}).items():
+            rows.append((stage_name, str(name), float(seconds)))
+    total = {str(name): float(seconds) for name, seconds in timing.get("total", {}).items()}
+    for name, seconds in total.items():
+        rows.append(("TOTAL", name, seconds))
+
+    csv_path = output_path / "timing_summary.csv"
+    with csv_path.open("w", encoding="utf-8") as handle:
+        handle.write("stage,item,seconds\n")
+        for stage, name, seconds in rows:
+            handle.write(f"{stage},{name},{seconds:.9f}\n")
+
+    md_path = output_path / "timing_summary.md"
+    ranked = sorted(total.items(), key=lambda item: item[1], reverse=True)
+    lines = [
+        "# SDITT Timing Summary",
+        "",
+        f"- preload cache: `{snapshot.get('preload_cache', {}).get('status', 'unknown')}`",
+        "",
+        "| rank | item | seconds |",
+        "| ---: | --- | ---: |",
+    ]
+    for index, (name, seconds) in enumerate(ranked, start=1):
+        lines.append(f"| {index} | `{name}` | {seconds:.3f} |")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return csv_path, md_path
 
 
 def _iteration_snapshot(record: Any) -> dict[str, Any]:
@@ -648,7 +709,7 @@ class _ProgressRecorder:
         patch_suffix = f",{patch_columns}" if patch_columns else ""
         with csv_path.open("w", encoding="utf-8") as handle:
             handle.write(
-                "stage,step,n_steps,time,dt,front_mileage,iterations,"
+                "stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,"
                 f"contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}\n"
             )
             for event in events:
@@ -656,7 +717,8 @@ class _ProgressRecorder:
                 patch_text = "".join(f",{value:.17g}" for value in patch_values)
                 handle.write(
                     f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
-                    f"{event.front_mileage:.17g},{event.iterations},{event.contact_force_norm:.17g},"
+                    f"{event.front_mileage:.17g},{event.iterations},{event.step_wall_time:.17g},"
+                    f"{event.contact_force_norm:.17g},"
                     f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}{patch_text}\n"
                 )
         svg_path.write_text(self.svg(events), encoding="utf-8")
@@ -672,14 +734,15 @@ class _ProgressRecorder:
         patch_columns = ",".join(_patch_force_column(label) for label in patch_labels)
         patch_suffix = f",{patch_columns}" if patch_columns else ""
         lines = [
-            f"stage,step,n_steps,time,dt,front_mileage,iterations,contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}"
+            f"stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}"
         ]
         for event in events:
             patch_values = _patch_force_values(event, len(patch_labels), fallback_max=len(patch_labels) == 1)
             patch_text = "".join(f",{value:.17g}" for value in patch_values)
             lines.append(
                 f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
-                f"{event.front_mileage:.17g},{event.iterations},{event.contact_force_norm:.17g},"
+                f"{event.front_mileage:.17g},{event.iterations},{event.step_wall_time:.17g},"
+                f"{event.contact_force_norm:.17g},"
                 f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}{patch_text}"
             )
         return "\n".join(lines) + "\n"
@@ -981,6 +1044,30 @@ def _profile_points(value: Any) -> np.ndarray:
     return array.reshape((-1, array.shape[-1]))[:, :2]
 
 
+def _format_elapsed_time(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _format_timing_top(timing: dict[str, float] | Any, *, limit: int = 3) -> str:
+    if not isinstance(timing, dict):
+        return ""
+    ranked = sorted(
+        ((str(name), float(seconds)) for name, seconds in timing.items() if float(seconds) > 0.0),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not ranked:
+        return ""
+    return " | ".join(f"{name} {seconds:.1f}s" for name, seconds in ranked[:limit])
+
+
+def _step_wall_times(events: Iterable[FullCaseProgressEvent]) -> np.ndarray:
+    return np.asarray([max(0.0, float(getattr(event, "step_wall_time", 0.0) or 0.0)) for event in events], dtype=float)
+
+
 class _LiveProgressWindow:
     def __init__(self, recorder: _ProgressRecorder, state: dict[str, Any]) -> None:
         import tkinter as tk
@@ -993,6 +1080,8 @@ class _LiveProgressWindow:
         self.root.title("SDITT Full-Case Progress")
         self.root.geometry("1040x720")
         self.closed = False
+        self.started_at = time.monotonic()
+        self.completed_elapsed: float | None = None
 
         self.summary = ttk.Label(self.root, text="Starting...", anchor="w")
         self.summary.pack(fill="x", padx=12, pady=(10, 4))
@@ -1017,13 +1106,18 @@ class _LiveProgressWindow:
 
     def _refresh(self) -> None:
         events = self.recorder.snapshot()
+        elapsed_seconds = self._elapsed_seconds()
+        elapsed_text = _format_elapsed_time(elapsed_seconds)
+        timing_text = ""
         if events:
             latest = events[-1]
+            timing_text = _format_timing_top(dict(latest.timing))
             percent = 0.0 if latest.n_steps <= 0 else min(100.0, latest.step_index / latest.n_steps * 100.0)
             self.progress.configure(value=percent)
             self.summary.configure(
                 text=(
                     f"{latest.stage} step {latest.step_index}/{latest.n_steps} | "
+                    f"elapsed {elapsed_text} | "
                     f"mileage {latest.front_mileage:.6f} m | time {latest.time:.6g} s | "
                     f"iterations {latest.iterations}"
                 )
@@ -1035,13 +1129,22 @@ class _LiveProgressWindow:
                 self.root.destroy()
                 return
         elif self.state.get("done"):
-            self.status.configure(text="Completed. Final progress files have been written; close the window to exit.")
+            suffix = f" Timing: {timing_text}." if timing_text else ""
+            self.status.configure(text=f"Completed in {elapsed_text}.{suffix} Final progress files have been written; close the window to exit.")
             if self.closed:
                 self.root.destroy()
                 return
         else:
-            self.status.configure(text="Running. Close hides the window; the simulation keeps running.")
+            suffix = f" Timing: {timing_text}." if timing_text else ""
+            self.status.configure(text=f"Running for {elapsed_text}.{suffix} Close hides the window; the simulation keeps running.")
         self.root.after(500, self._refresh)
+
+    def _elapsed_seconds(self) -> float:
+        if self.state.get("done") and self.completed_elapsed is None:
+            self.completed_elapsed = time.monotonic() - self.started_at
+        if self.completed_elapsed is not None:
+            return self.completed_elapsed
+        return time.monotonic() - self.started_at
 
     def _draw(self, events: tuple[FullCaseProgressEvent, ...]) -> None:
         self._latest_events = events
@@ -1049,15 +1152,27 @@ class _LiveProgressWindow:
         width = max(int(self.canvas.winfo_width()), 420)
         height = max(int(self.canvas.winfo_height()), 360)
         margin_left = 70
-        legend_width = 240 if width >= 820 else 0
-        margin_right = 30 + legend_width
+        content_width = max(260, width - margin_left - 30)
+        wide_layout = width >= 860
+        profile_column_gap = 62 if wide_layout else 0
+        profile_width = max(270, min(360, int(content_width * 0.35))) if wide_layout else 0
+        plot_width = max(260, content_width - profile_column_gap - profile_width)
+        profile_x = margin_left + plot_width + profile_column_gap
         plot_top = 45
         compact = height < 560
-        profile_gap = 42 if compact else 60
         available_height = max(220, height - plot_top - 28)
-        plot_height = max(115, min(250, int(available_height * 0.42)))
-        profile_height = max(60, available_height - plot_height - profile_gap)
-        plot_width = max(220, width - margin_left - margin_right)
+        if wide_layout:
+            chart_gap = 54 if compact else 66
+            plot_height = max(115, min(250, int((available_height - chart_gap) * 0.52)))
+            step_plot_height = max(105, available_height - plot_height - chart_gap)
+            step_plot_y = plot_top + plot_height + chart_gap
+            profile_height = available_height
+        else:
+            profile_gap = 42 if compact else 60
+            plot_height = max(115, min(250, int(available_height * 0.42)))
+            step_plot_height = plot_height
+            step_plot_y = plot_top
+            profile_height = max(60, available_height - plot_height - profile_gap)
         xs = np.asarray([event.front_mileage for event in events], dtype=float)
         patch_labels, patch_indices = _display_patch_force_selection(events)
         patch_forces = _patch_force_matrix(events, patch_labels, patch_indices)
@@ -1073,15 +1188,36 @@ class _LiveProgressWindow:
             height=plot_height,
             title="Patch wheel-rail force magnitude",
             y_label="Patch force magnitude (kN)",
-            show_legend=legend_width > 0,
+            show_legend=not wide_layout and width >= 820,
         )
-        self._draw_profile_panel(
-            events[-1].profile_snapshot,
-            x=margin_left,
-            y=plot_top + plot_height + profile_gap,
-            width=plot_width,
-            height=profile_height,
-        )
+        if wide_layout:
+            self._draw_plot(
+                xs,
+                _step_wall_times(events),
+                stages,
+                x=margin_left,
+                y=step_plot_y,
+                width=plot_width,
+                height=step_plot_height,
+                title="Step wall time",
+                y_label="Seconds/step",
+            )
+            self._draw_profile_panel(
+                events[-1].profile_snapshot,
+                x=profile_x,
+                y=plot_top,
+                width=profile_width,
+                height=profile_height,
+                orientation="vertical",
+            )
+        else:
+            self._draw_profile_panel(
+                events[-1].profile_snapshot,
+                x=margin_left,
+                y=plot_top + plot_height + profile_gap,
+                width=plot_width,
+                height=profile_height,
+            )
 
     def _on_canvas_resize(self, _event: Any) -> None:
         if not self._latest_events:
@@ -1215,6 +1351,7 @@ class _LiveProgressWindow:
         y: int,
         width: int,
         height: int,
+        orientation: str = "horizontal",
     ) -> None:
         self.canvas.create_text(
             x,
@@ -1236,24 +1373,44 @@ class _LiveProgressWindow:
             )
             return
 
-        column_gap = max(18, int(width * 0.035))
-        column_width = max(120, int((width - column_gap) / 2))
-        self._draw_side_profile_panel(
-            snapshot.sides.get("L"),
-            label=f"Left {snapshot.wheelset}",
-            x=x,
-            y=y,
-            width=column_width,
-            height=height,
-        )
-        self._draw_side_profile_panel(
-            snapshot.sides.get("R"),
-            label=f"Right {snapshot.wheelset}",
-            x=x + column_width + column_gap,
-            y=y,
-            width=max(120, width - column_width - column_gap),
-            height=height,
-        )
+        if orientation == "vertical":
+            row_gap = max(16, int(height * 0.035))
+            row_height = max(120, int((height - row_gap) / 2))
+            self._draw_side_profile_panel(
+                snapshot.sides.get("L"),
+                label=f"Left {snapshot.wheelset}",
+                x=x,
+                y=y,
+                width=width,
+                height=row_height,
+            )
+            self._draw_side_profile_panel(
+                snapshot.sides.get("R"),
+                label=f"Right {snapshot.wheelset}",
+                x=x,
+                y=y + row_height + row_gap,
+                width=width,
+                height=max(120, height - row_height - row_gap),
+            )
+        else:
+            column_gap = max(18, int(width * 0.035))
+            column_width = max(120, int((width - column_gap) / 2))
+            self._draw_side_profile_panel(
+                snapshot.sides.get("L"),
+                label=f"Left {snapshot.wheelset}",
+                x=x,
+                y=y,
+                width=column_width,
+                height=height,
+            )
+            self._draw_side_profile_panel(
+                snapshot.sides.get("R"),
+                label=f"Right {snapshot.wheelset}",
+                x=x + column_width + column_gap,
+                y=y,
+                width=max(120, width - column_width - column_gap),
+                height=height,
+            )
 
     def _draw_side_profile_panel(
         self,
@@ -1372,6 +1529,7 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 plot_progress=args.plot_progress,
                 plot_every=args.plot_every,
                 save_progress=True,
+                preload_cache_dir=args.preload_cache_dir,
                 progress_recorder=recorder,
                 matlab_baseline_path=args.matlab_baseline,
                 abs_tolerance=args.abs_tol,
@@ -1423,6 +1581,12 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plot-progress", action="store_true", help="Compatibility alias for final progress output.")
     parser.add_argument("--save-progress", action="store_true", help="Write final progress CSV and SVG after the run completes.")
     parser.add_argument("--live-window", action="store_true", help="Show a Tk realtime progress window while the simulation runs.")
+    parser.add_argument(
+        "--preload-cache-dir",
+        type=Path,
+        default=None,
+        help="Cache completed Preload state here and reuse it for identical input settings.",
+    )
     parser.add_argument("--plot-every", type=int, default=1, help="Reserved progress refresh interval; final files are written once.")
     parser.add_argument("--abs-tol", type=float, default=DEFAULT_ABS_TOLERANCE)
     parser.add_argument("--rel-tol", type=float, default=DEFAULT_REL_TOLERANCE)
@@ -1444,6 +1608,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         plot_progress=args.plot_progress,
         plot_every=args.plot_every,
         save_progress=args.save_progress,
+        preload_cache_dir=args.preload_cache_dir,
         matlab_baseline_path=args.matlab_baseline,
         abs_tolerance=args.abs_tol,
         rel_tolerance=args.rel_tol,

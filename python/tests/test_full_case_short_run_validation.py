@@ -7,7 +7,10 @@ import numpy as np
 from sditt.simulation import FullCaseProgressEvent
 from sditt.validation.full_case_short_run import (
     _ProgressRecorder,
+    _format_elapsed_time,
+    _format_timing_top,
     _parse_args,
+    _step_wall_times,
     build_full_case_short_run_report,
     build_python_short_run_snapshot,
     compare_short_run_snapshots,
@@ -153,8 +156,59 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
 
 
 def test_full_case_short_run_validation_parses_live_window_and_save_progress_flags() -> None:
-    args = _parse_args(["--live-window", "--save-progress", "--plot-every", "25"])
+    args = _parse_args(["--live-window", "--save-progress", "--plot-every", "25", "--preload-cache-dir", "cache"])
 
     assert args.live_window
     assert args.save_progress
     assert args.plot_every == 25
+    assert str(args.preload_cache_dir) == "cache"
+
+
+def test_format_elapsed_time_uses_stable_clock_format() -> None:
+    assert _format_elapsed_time(-1.0) == "00:00:00"
+    assert _format_elapsed_time(9.9) == "00:00:09"
+    assert _format_elapsed_time(65.0) == "00:01:05"
+    assert _format_elapsed_time(3661.0) == "01:01:01"
+
+
+def test_format_timing_top_ranks_slowest_items() -> None:
+    assert _format_timing_top({"contact_force": 1.25, "integrate": 3.5, "geometry": 2.0}, limit=2) == (
+        "integrate 3.5s | geometry 2.0s"
+    )
+
+
+def test_step_wall_times_uses_progress_event_values() -> None:
+    events = (
+        FullCaseProgressEvent(
+            stage="Cal",
+            step_index=1,
+            n_steps=2,
+            time=1.0e-4,
+            dt=1.0e-4,
+            front_mileage=48.0,
+            iterations=2,
+            normal_error=0.0,
+            normal_tangential_error=0.0,
+            contact_force_norm=1.0,
+            total_force_norm=2.0,
+            max_patch_force_z=3.0,
+            step_wall_time=1.25,
+        ),
+        FullCaseProgressEvent(
+            stage="Cal",
+            step_index=2,
+            n_steps=2,
+            time=2.0e-4,
+            dt=1.0e-4,
+            front_mileage=48.1,
+            iterations=3,
+            normal_error=0.0,
+            normal_tangential_error=0.0,
+            contact_force_norm=1.0,
+            total_force_norm=2.0,
+            max_patch_force_z=3.0,
+            step_wall_time=0.5,
+        ),
+    )
+
+    assert np.allclose(_step_wall_times(events), [1.25, 0.5])

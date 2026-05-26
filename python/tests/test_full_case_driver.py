@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -327,6 +328,41 @@ def test_run_default_full_case_driver_executes_preload_then_cal_in_diagnostic_mo
         cal.history.total_force[-1],
         result.preparation.gravity_preload.pxt_gravity + expected_contact_force[:, 0],
     )
+
+
+def test_preload_cache_reuses_completed_preload_state() -> None:
+    cache_dir = Path("outputs") / "test_preload_cache" / uuid.uuid4().hex
+    first_events = []
+    second_events = []
+    first_settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        n_steps_per_stage=1,
+        preload_cache_dir=cache_dir,
+        progress_callback=first_events.append,
+    )
+    second_settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        n_steps_per_stage=1,
+        preload_cache_dir=cache_dir,
+        progress_callback=second_events.append,
+    )
+    first = run_default_full_case_driver(settings=first_settings)
+    second = run_default_full_case_driver(settings=second_settings)
+
+    assert first.preload_cache_status == "saved"
+    assert first.preload_cache_path is not None
+    assert first.preload_cache_path.exists()
+    assert [stage.stage for stage in first.stages] == ["Preload", "Cal"]
+    assert second.preload_cache_status == "hit"
+    assert [stage.stage for stage in second.stages] == ["Cal"]
+    assert second.stages[0].output_rows[0].front_mileage > first.stages[0].output_rows[-1].front_mileage
+    assert second.stages[0].history.timing
+    assert [event.stage for event in first_events] == ["Preload", "Cal"]
+    assert [event.stage for event in second_events] == ["Preload", "Cal"]
+    assert second_events[0].front_mileage == pytest.approx(first_events[0].front_mileage)
+    assert all(event.step_wall_time >= 0.0 for event in second_events)
 
 
 def _initial_stage_front_mileage_for_test(result) -> float:
