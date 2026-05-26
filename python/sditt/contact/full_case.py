@@ -7,6 +7,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from sditt.contact.forces import (
+    NormalDampingClipDiagnostic,
     add_hu_guo_stripes_damping,
     contact_to_track_matrix,
     hertz_normal_force,
@@ -41,6 +42,7 @@ class FullCaseWheelRailContactResult:
     track_profiles: dict[str, TrackProfileSet]
     d0_by_wheelset: dict[str, float]
     relvel_max_by_wheelset: dict[str, dict[str, float]]
+    damping_clip_diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 def solve_default_wheel_rail_contact(
@@ -87,6 +89,7 @@ def solve_default_wheel_rail_contact(
     track_profiles: dict[str, TrackProfileSet] = {}
     result_d0_by_wheelset: dict[str, float] = {}
     result_relvel_max_by_wheelset: dict[str, dict[str, float]] = {}
+    damping_clip_diagnostics: list[dict[str, Any]] = []
     wheel_radius_profiles = {"L": wheel_profiles.radius_left, "R": wheel_profiles.radius_right}
     wheel_shape_profiles = {"L": wheel_profiles.left, "R": wheel_profiles.right}
     wheel_angle_profiles = {
@@ -193,6 +196,9 @@ def solve_default_wheel_rail_contact(
             con_ws[wheelset]["Vsdc"][side] = side_result["vsdc"]
             con_ws[wheelset]["Vjsdc"][side] = side_result["vjsdc"]
             con_ws[wheelset]["Vgd"][side] = side_result["vgd"][:, np.newaxis]
+            con_ws[wheelset]["Normal_Damping_Clips"] = con_ws[wheelset].get(
+                "Normal_Damping_Clips", {"L": (), "R": ()}
+            )
             con_ws[wheelset]["Elastic_Normal_Force"] = con_ws[wheelset].get(
                 "Elastic_Normal_Force", {"L": np.zeros((0, 6), dtype=float), "R": np.zeros((0, 6), dtype=float)}
             )
@@ -221,6 +227,16 @@ def solve_default_wheel_rail_contact(
             con_ws[wheelset]["Area_STRIPES"][side] = side_result["area_stripes"]
             con_ws[wheelset]["Epsilon"][side] = side_result["epsilon"]
             con_ws[wheelset]["Con_STRIPES"][side] = side_result["con_stripes"]
+            clip_records = _side_damping_clip_diagnostics(
+                tuple(side_result["normal_damping_clips"]),
+                mileage=mileage,
+                wheelset=wheelset,
+                side=side,
+                patch_ids=np.asarray(side_result["patch_ids"], dtype=int),
+                exp_dummy_rail=exp_dummy_rail,
+            )
+            con_ws[wheelset]["Normal_Damping_Clips"][side] = clip_records
+            damping_clip_diagnostics.extend(clip_records)
             for patch_id, relvel_max in zip(
                 np.asarray(side_result["patch_ids"], dtype=int),
                 np.asarray(side_result["con_rel_vel_max"], dtype=float),
@@ -250,6 +266,7 @@ def solve_default_wheel_rail_contact(
         track_profiles=track_profiles,
         d0_by_wheelset=result_d0_by_wheelset,
         relvel_max_by_wheelset=result_relvel_max_by_wheelset,
+        damping_clip_diagnostics=tuple(damping_clip_diagnostics),
     )
 
 
@@ -529,7 +546,41 @@ def _solve_wheel_side_contact(
         "area_stripes": normal_force_result.area if normal_force_result is not None else np.zeros((patch_count,), dtype=float),
         "epsilon": normal_force_result.epsilon if normal_force_result is not None else np.zeros((patch_count,), dtype=float),
         "con_stripes": normal_force_result.patches if normal_force_result is not None else (),
+        "normal_damping_clips": (
+            normal_force_result.damping_clip_diagnostics if normal_force_result is not None else ()
+        ),
     }
+
+
+def _side_damping_clip_diagnostics(
+    diagnostics: tuple[NormalDampingClipDiagnostic, ...],
+    *,
+    mileage: float,
+    wheelset: str,
+    side: str,
+    patch_ids: np.ndarray,
+    exp_dummy_rail: list[str],
+) -> tuple[dict[str, Any], ...]:
+    records: list[dict[str, Any]] = []
+    for diagnostic in diagnostics:
+        patch_index = int(diagnostic.patch_index)
+        patch_id = int(patch_ids[patch_index]) if 0 <= patch_index < patch_ids.size else 0
+        dummy_rail = exp_dummy_rail[patch_id - 1] if 1 <= patch_id <= len(exp_dummy_rail) else ""
+        records.append(
+            {
+                "mileage": float(mileage),
+                "wheelset": str(wheelset),
+                "side": str(side),
+                "patch_index": patch_index,
+                "patch_id": patch_id,
+                "dummy_rail": dummy_rail,
+                "elastic_force": float(diagnostic.elastic_force),
+                "raw_damping_force": float(diagnostic.raw_damping_force),
+                "clipped_damping_force": float(diagnostic.clipped_damping_force),
+                "relative_velocity_ratio": float(diagnostic.relative_velocity_ratio),
+            }
+        )
+    return tuple(records)
 
 
 def _estimate_contact_offset(
@@ -906,4 +957,5 @@ def _empty_side_result() -> dict[str, np.ndarray]:
         "area_stripes": np.zeros((0,), dtype=float),
         "epsilon": np.zeros((0,), dtype=float),
         "con_stripes": (),
+        "normal_damping_clips": (),
     }

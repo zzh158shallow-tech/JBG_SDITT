@@ -102,6 +102,9 @@ class FullCaseProgressEvent:
     profile_snapshot: FullCaseProfileSnapshot | None = None
     timing: Mapping[str, float] = field(default_factory=dict)
     step_wall_time: float = 0.0
+    damping_clip_count: int = 0
+    damping_clip_max_delta: float = 0.0
+    damping_clip_diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,10 @@ class FullDefaultCaseSettings:
     progress_callback: Callable[[FullCaseProgressEvent], None] | None = None
     frozen_contact_input: "FullCaseFrozenContactInput | None" = None
     preload_cache_dir: str | Path | None = None
+    history_retention_steps: int | None = 256
+    checkpoint_dir: str | Path | None = None
+    resume_checkpoint: bool = False
+    checkpoint_interval_m: float | None = 10.0
     iteration_settings: CoupledIterationSettings = CoupledIterationSettings(
         max_iterations=30,
         force_tolerance=1.0e-3,
@@ -350,6 +357,10 @@ class FullDefaultCaseRunResult:
     stages: tuple[FullDefaultCaseStageResult, ...]
     preload_cache_status: str = "disabled"
     preload_cache_path: Path | None = None
+    checkpoint_status: str = "disabled"
+    checkpoint_path: Path | None = None
+    resumed_from_checkpoint: bool = False
+    resumed_checkpoint_mileage: float | None = None
 
     @property
     def is_physical_complete(self) -> bool:
@@ -369,6 +380,7 @@ class MissingFullCasePhysicsError(RuntimeError):
 
 
 _PRELOAD_CACHE_VERSION = 1
+_RUN_CHECKPOINT_VERSION = 1
 
 
 def _preload_cache_path(preparation: FullDefaultCasePreparation) -> Path | None:
@@ -383,6 +395,29 @@ def _preload_cache_key(preparation: FullDefaultCasePreparation) -> str:
     fingerprint = _preload_cache_fingerprint(preparation)
     payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _run_checkpoint_path(preparation: FullDefaultCasePreparation) -> Path | None:
+    cache_dir = preparation.settings.checkpoint_dir
+    if cache_dir is None:
+        return None
+    key = _run_checkpoint_key(preparation)
+    return Path(cache_dir) / f"checkpoint_{key}.pkl"
+
+
+def _run_checkpoint_key(preparation: FullDefaultCasePreparation) -> str:
+    fingerprint = _run_checkpoint_fingerprint(preparation)
+    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _run_checkpoint_fingerprint(preparation: FullDefaultCasePreparation) -> dict[str, Any]:
+    fingerprint = _preload_cache_fingerprint(preparation)
+    fingerprint["version"] = _RUN_CHECKPOINT_VERSION
+    fingerprint["stage_end_mileage"] = {
+        stage: _stage_end_mileage(preparation, stage) for stage in preparation.operating_case.simulation_stages
+    }
+    return fingerprint
 
 
 def _preload_cache_fingerprint(preparation: FullDefaultCasePreparation) -> dict[str, Any]:
@@ -435,6 +470,76 @@ def _load_preload_cache(preparation: FullDefaultCasePreparation, cache_path: Pat
         return None
     data = payload.get("data")
     return data if isinstance(data, dict) else None
+
+
+def _load_run_checkpoint(preparation: FullDefaultCasePreparation, checkpoint_path: Path) -> dict[str, Any] | None:
+    if not checkpoint_path.exists():
+        return None
+    try:
+        with checkpoint_path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception:
+        return None
+    if payload.get("fingerprint") != _run_checkpoint_fingerprint(preparation):
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def find_default_full_case_checkpoint(
+    *,
+    repo_root: str | Path | None = None,
+    settings: FullDefaultCaseSettings | None = None,
+    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+) -> dict[str, Any] | None:
+    preparation = prepare_default_full_case(repo_root=repo_root, settings=settings, operating_case=operating_case)
+    checkpoint_path = _run_checkpoint_path(preparation)
+    if checkpoint_path is None:
+        return None
+    data = _load_run_checkpoint(preparation, checkpoint_path)
+    if data is None:
+        return None
+    return {
+        "path": checkpoint_path,
+        "stage": data.get("stage"),
+        "step_index": data.get("step_index"),
+        "time": data.get("time"),
+        "front_mileage": data.get("front_mileage"),
+    }
+
+
+def _write_run_checkpoint(
+    preparation: FullDefaultCasePreparation,
+    checkpoint_path: Path,
+    *,
+    stage: SimulationStage,
+    original_stage_start_front_mileage: float,
+    accepted: Any,
+) -> None:
+    rail = accepted.rail_response
+    geometry = accepted.contact_geometry
+    contact = geometry.wheel_rail_contact if geometry is not None else None
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fingerprint": _run_checkpoint_fingerprint(preparation),
+        "data": {
+            "stage": stage,
+            "original_stage_start_front_mileage": float(original_stage_start_front_mileage),
+            "time": float(accepted.time),
+            "step_index": int(accepted.step_index),
+            "front_mileage": float(rail.front_mileage),
+            "displacement": accepted.displacement.copy(),
+            "velocity": accepted.velocity.copy(),
+            "acceleration": accepted.acceleration.copy(),
+            "contact_force": accepted.contact_force.copy(),
+            "contact_state": _contact_state_from_contact_result(contact),
+            "displacement_history_seed": _copy_cached_array(accepted.displacement_history_seed),
+            "velocity_history_seed": _copy_cached_array(accepted.velocity_history_seed),
+            "acceleration_history_seed": _copy_cached_array(accepted.acceleration_history_seed),
+        },
+    }
+    with checkpoint_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _write_preload_cache(
@@ -606,9 +711,37 @@ def run_default_full_case_driver(
     acceleration_history_seed: np.ndarray | None = None
     preload_cache_path = _preload_cache_path(preparation)
     preload_cache_status = "disabled" if preload_cache_path is None else "miss"
+    checkpoint_path = _run_checkpoint_path(preparation)
+    checkpoint_status = "disabled" if checkpoint_path is None else "miss"
+    resumed_from_checkpoint = False
+    resumed_checkpoint_mileage: float | None = None
     stages_to_run = tuple(preparation.operating_case.simulation_stages)
     preload_progress_events: list[FullCaseProgressEvent] = []
-    if preload_cache_path is not None and preparation.settings.frozen_contact_input is None:
+    if checkpoint_path is not None and preparation.settings.resume_checkpoint and preparation.settings.frozen_contact_input is None:
+        checkpoint = _load_run_checkpoint(preparation, checkpoint_path)
+        if checkpoint is not None:
+            checkpoint_status = "hit"
+            resumed_from_checkpoint = True
+            resumed_checkpoint_mileage = float(checkpoint["front_mileage"])
+            resume_stage = str(checkpoint["stage"])
+            displacement = checkpoint["displacement"].copy()
+            velocity = checkpoint["velocity"].copy()
+            acceleration = checkpoint["acceleration"].copy()
+            contact_force = checkpoint["contact_force"].copy()
+            stage_start_front_mileage = float(checkpoint["original_stage_start_front_mileage"])
+            contact_state = _clone_contact_state(checkpoint["contact_state"])
+            displacement_history_seed = _copy_cached_array(checkpoint["displacement_history_seed"])
+            velocity_history_seed = _copy_cached_array(checkpoint["velocity_history_seed"])
+            acceleration_history_seed = _copy_cached_array(checkpoint["acceleration_history_seed"])
+            if resume_stage == "Preload":
+                stages_to_run = tuple(preparation.operating_case.simulation_stages)
+            else:
+                stages_to_run = _stages_from(preparation.operating_case.simulation_stages, resume_stage)
+    if (
+        not resumed_from_checkpoint
+        and preload_cache_path is not None
+        and preparation.settings.frozen_contact_input is None
+    ):
         cached = _load_preload_cache(preparation, preload_cache_path)
         if cached is not None:
             preload_cache_status = "hit"
@@ -627,27 +760,65 @@ def run_default_full_case_driver(
             stages_to_run = tuple(stage for stage in stages_to_run if stage != "Preload")
 
     for stage in stages_to_run:
+        stage_step_index0 = 0
+        stage_time0 = 0.0
+        original_stage_start_front_mileage = stage_start_front_mileage
+        if resumed_from_checkpoint and checkpoint_path is not None and checkpoint_status == "hit":
+            checkpoint = _load_run_checkpoint(preparation, checkpoint_path)
+            if checkpoint is not None and str(checkpoint["stage"]) == stage:
+                stage_step_index0 = int(checkpoint["step_index"])
+                stage_time0 = float(checkpoint["time"])
+                original_stage_start_front_mileage = float(checkpoint["original_stage_start_front_mileage"])
+                stage_start_front_mileage = original_stage_start_front_mileage
         stage_wall_start = time.perf_counter()
+        current_front_mileage = stage_start_front_mileage + preparation.operating_case.vlc * stage_time0
         callbacks, build_stage_storage, extract_contact_state = _diagnostic_callbacks(
             preparation,
             stage,
             contact_state=contact_state,
             stage_start_front_mileage=stage_start_front_mileage,
         )
-        contact_force = _contact_force_from_contact_state(
-            preparation,
-            stage,
-            displacement,
-            velocity,
-            stage_start_front_mileage + preparation.operating_case.vlc * preparation.settings.dt,
-            contact_state,
-        )
-        stage_steps = _stage_step_count(preparation, stage, stage_start_front_mileage)
+        if stage_step_index0 == 0:
+            contact_force = _contact_force_from_contact_state(
+                preparation,
+                stage,
+                displacement,
+                velocity,
+                current_front_mileage + preparation.operating_case.vlc * preparation.settings.dt,
+                contact_state,
+            )
+        stage_steps = _stage_step_count(preparation, stage, current_front_mileage)
+        stage_display_steps = stage_step_index0 + stage_steps
+        if stage_steps == 0:
+            stage_start_front_mileage = current_front_mileage
+            continue
         progress_mirror = (
             preload_progress_events.append
             if stage == "Preload" and preload_cache_path is not None and preparation.settings.frozen_contact_input is None
             else None
         )
+        progress_callback = _progress_callback(
+            preparation,
+            stage,
+            stage_display_steps,
+            build_stage_storage,
+            extra_callback=progress_mirror,
+        )
+        checkpoint_callback = _run_checkpoint_callback(
+            preparation,
+            checkpoint_path,
+            stage=stage,
+            original_stage_start_front_mileage=original_stage_start_front_mileage,
+            initial_front_mileage=current_front_mileage,
+        )
+
+        def accepted_callback(accepted: Any) -> None:
+            nonlocal checkpoint_status
+            if progress_callback is not None:
+                progress_callback(accepted)
+            if checkpoint_callback is not None and checkpoint_callback(accepted):
+                checkpoint_status = "saved"
+
         history = run_coupled_time_iteration(
             dynamics_system,
             callbacks,
@@ -661,13 +832,10 @@ def run_default_full_case_driver(
             acceleration_history0=acceleration_history_seed,
             contact_force0=contact_force,
             settings=preparation.settings.iteration_settings,
-            accepted_step_callback=_progress_callback(
-                preparation,
-                stage,
-                stage_steps,
-                build_stage_storage,
-                extra_callback=progress_mirror,
-            ),
+            accepted_step_callback=accepted_callback,
+            history_retention_steps=preparation.settings.history_retention_steps,
+            time0=stage_time0,
+            step_index0=stage_step_index0,
         )
         iteration_records, output_rows = build_stage_storage(history)
         contact_state = extract_contact_state(history)
@@ -717,12 +885,59 @@ def run_default_full_case_driver(
         stages=tuple(stages),
         preload_cache_status=preload_cache_status,
         preload_cache_path=preload_cache_path,
+        checkpoint_status=checkpoint_status,
+        checkpoint_path=checkpoint_path,
+        resumed_from_checkpoint=resumed_from_checkpoint,
+        resumed_checkpoint_mileage=resumed_checkpoint_mileage,
     )
 
 
 def _linear_system(system: SystemMatrices | SparseSystemMatrices) -> LinearSecondOrderSystem:
     use_sparse = isinstance(system, SparseSystemMatrices)
     return LinearSecondOrderSystem(system.Mxt, system.Cxt, system.Kxt, use_sparse=use_sparse)
+
+
+def _stages_from(stages: tuple[SimulationStage, ...], start_stage: str) -> tuple[SimulationStage, ...]:
+    for index, stage in enumerate(stages):
+        if stage == start_stage:
+            return stages[index:]
+    return stages
+
+
+def _run_checkpoint_callback(
+    preparation: FullDefaultCasePreparation,
+    checkpoint_path: Path | None,
+    *,
+    stage: SimulationStage,
+    original_stage_start_front_mileage: float,
+    initial_front_mileage: float,
+) -> Callable[[Any], bool] | None:
+    interval = preparation.settings.checkpoint_interval_m
+    if checkpoint_path is None or interval is None or interval <= 0.0:
+        return None
+    last_bucket = _checkpoint_mileage_bucket(initial_front_mileage, interval)
+
+    def save_if_crossed(accepted: Any) -> bool:
+        nonlocal last_bucket
+        rail = accepted.rail_response
+        current_bucket = _checkpoint_mileage_bucket(float(rail.front_mileage), interval)
+        if current_bucket == last_bucket:
+            return False
+        last_bucket = current_bucket
+        _write_run_checkpoint(
+            preparation,
+            checkpoint_path,
+            stage=stage,
+            original_stage_start_front_mileage=original_stage_start_front_mileage,
+            accepted=accepted,
+        )
+        return True
+
+    return save_if_crossed
+
+
+def _checkpoint_mileage_bucket(mileage: float, interval: float) -> int:
+    return int(np.floor(float(mileage) / float(interval)))
 
 
 def _stage_step_count(preparation: FullDefaultCasePreparation, stage: SimulationStage, start_mileage: float) -> int:
@@ -734,6 +949,8 @@ def _stage_step_count(preparation: FullDefaultCasePreparation, stage: Simulation
         raise ValueError("vehicle speed and dt must produce nonzero mileage increment")
     steps_float = (float(end_mileage) - float(start_mileage)) / step_distance
     if steps_float < -1.0e-12:
+        if steps_float > -1.0:
+            return 0
         raise ValueError(
             f"{stage} end mileage {end_mileage} is behind start mileage {start_mileage} for current direction"
         )
@@ -784,6 +1001,14 @@ def _progress_callback(
         else:
             patch_force_y = -contact.prhxf[:, 1] - contact.pjch[:, 0]
             patch_force_z = -contact.prhxf[:, 2] - contact.pjcc[:, 0]
+        damping_clip_diagnostics = tuple(contact.damping_clip_diagnostics) if contact is not None else ()
+        damping_clip_max_delta = max(
+            (
+                abs(float(item["raw_damping_force"]) - float(item["clipped_damping_force"]))
+                for item in damping_clip_diagnostics
+            ),
+            default=0.0,
+        )
         patch_force_magnitude = np.hypot(patch_force_y, patch_force_z)
         patch_force_labels = _progress_patch_force_labels(preparation.stage_inp_par[stage])
         profile_snapshot = _progress_profile_snapshot(preparation, stage, accepted, contact)
@@ -806,6 +1031,9 @@ def _progress_callback(
             profile_snapshot=profile_snapshot,
             timing=dict(getattr(accepted, "timing", {}) or {}),
             step_wall_time=float(getattr(accepted, "step_wall_time", 0.0) or 0.0),
+            damping_clip_count=len(damping_clip_diagnostics),
+            damping_clip_max_delta=damping_clip_max_delta,
+            damping_clip_diagnostics=damping_clip_diagnostics,
         )
         if callback is not None:
             callback(event)
@@ -992,6 +1220,25 @@ def _diagnostic_callbacks(
     step_result_contact_state: dict[int, FullCaseContactState] = {}
     previous_iteration_pjc: dict[int, np.ndarray] = {}
     reuse_contact_state_within_step = preparation.settings.cut_freq is None
+    history_retention_steps = preparation.settings.history_retention_steps
+
+    def prune_step_contact_working_state(step_index: int) -> None:
+        for key in tuple(step_contact_state):
+            if key < step_index:
+                del step_contact_state[key]
+        for key in tuple(step_result_contact_state):
+            if key < step_index - 1:
+                del step_result_contact_state[key]
+        for key in tuple(previous_iteration_pjc):
+            if key < step_index:
+                del previous_iteration_pjc[key]
+        if history_retention_steps is not None:
+            first_kept_step = step_index - int(history_retention_steps) + 1
+            if first_kept_step > 1:
+                del iteration_records[: next(
+                    (index for index, record in enumerate(iteration_records) if record.step_index >= first_kept_step),
+                    len(iteration_records),
+                )]
 
     def recover_track_response(state: CoupledStepState) -> FullCaseRailRecovery:
         front_mileage = stage_start_front_mileage + preparation.operating_case.vlc * state.time
@@ -1020,6 +1267,7 @@ def _diagnostic_callbacks(
         )
 
     def contact_geometry(state: CoupledStepState, rail: FullCaseRailRecovery) -> FullCaseContactDiagnostics:
+        prune_step_contact_working_state(state.step_index)
         selected_profiles = preparation.profile_selector.select(rail.front_mileage)
         wheel_rail_contact = None
         if preparation.settings.frozen_contact_input is None:
@@ -1232,12 +1480,19 @@ def _diagnostic_callbacks(
         nonlocal last_accepted_contact_state
         accepted_keys = {
             (
-                step_index,
-                int(history.iterations[step_index]),
-                float(history.dt[step_index]),
-                float(history.time[step_index]),
+                int(step_index),
+                int(iterations),
+                float(dt),
+                float(time_value),
             )
-            for step_index in range(1, history.time.size)
+            for step_index, iterations, dt, time_value in zip(
+                history.step_index,
+                history.iterations,
+                history.dt,
+                history.time,
+                strict=True,
+            )
+            if int(step_index) != 0
         }
         stored_iterations: list[FullCaseIterationRecord] = []
         accepted_by_step: dict[int, FullCaseIterationRecord] = {}
@@ -1252,9 +1507,10 @@ def _diagnostic_callbacks(
             _build_output_row(
                 preparation,
                 accepted_by_step[step_index],
-                iterations=int(history.iterations[step_index]),
+                iterations=int(iterations),
             )
-            for step_index in range(1, history.time.size)
+            for step_index, iterations in zip(history.step_index, history.iterations, strict=True)
+            if int(step_index) != 0 and int(step_index) in accepted_by_step
         )
         last_accepted_contact_state = _clone_contact_state(output_rows[-1].contact_state) if output_rows else None
         return tuple(stored_iterations), output_rows
@@ -1481,6 +1737,24 @@ def _clone_contact_state(contact_state: FullCaseContactState | None) -> FullCase
         prhx=_copy_array_or_none(contact_state.prhx),
         prhxf=_copy_array_or_none(contact_state.prhxf),
         con_ws=deepcopy(contact_state.con_ws),
+    )
+
+
+def _contact_state_from_contact_result(contact: FullCaseWheelRailContactResult | None) -> FullCaseContactState | None:
+    if contact is None:
+        return None
+    return FullCaseContactState(
+        d0_by_wheelset={wheelset: float(value) for wheelset, value in contact.d0_by_wheelset.items()},
+        relvel_max_by_wheelset={
+            wheelset: {dummy_rail: float(value) for dummy_rail, value in relvel.items()}
+            for wheelset, relvel in contact.relvel_max_by_wheelset.items()
+        },
+        pjc=np.asarray(contact.pjc, dtype=float).copy(),
+        pjch=np.asarray(contact.pjch, dtype=float).copy(),
+        pjcc=np.asarray(contact.pjcc, dtype=float).copy(),
+        prhx=np.asarray(contact.prhx, dtype=float).copy(),
+        prhxf=np.asarray(contact.prhxf, dtype=float).copy(),
+        con_ws=deepcopy(contact.con_ws),
     )
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -35,6 +35,12 @@ class DefaultRailProfileSelector:
     bezier_profiles: Mapping[str, BezierProfileData]
     distance_vehicle: Mapping[str, float]
     num_interp: int = 1000
+    _select_cache: dict[tuple[float, tuple[str, ...]], DummyRailProfiles] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def select(
         self,
@@ -44,6 +50,11 @@ class DefaultRailProfileSelector:
         """Construct MATLAB-style ``RailPro_ProCS`` records for one front mileage."""
 
         requested = tuple(profile_num_interp)
+        cache_key = (float(j1), requested)
+        cached = self._select_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         profiles: DummyRailProfiles = {}
         for rail in requested:
             if rail == "L1":
@@ -83,6 +94,9 @@ class DefaultRailProfileSelector:
                 )
             else:
                 raise ValueError(f"unsupported default dummy rail profile: {rail}")
+        if len(self._select_cache) >= 32:
+            self._select_cache.pop(next(iter(self._select_cache)))
+        self._select_cache[cache_key] = profiles
         return profiles
 
     @cached_property

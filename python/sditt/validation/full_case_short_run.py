@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +18,7 @@ from sditt.simulation import (
     FullCaseSideProfileSnapshot,
     FullDefaultCaseRunResult,
     FullDefaultCaseSettings,
+    find_default_full_case_checkpoint,
     run_default_full_case_driver,
 )
 
@@ -66,6 +67,9 @@ def build_python_short_run_snapshot(
     use_sparse: bool = True,
     use_matlab_mileage_endpoints: bool = False,
     preload_cache_dir: str | Path | None = None,
+    history_retention_steps: int | None = 256,
+    checkpoint_dir: str | Path | None = None,
+    resume_checkpoint: bool = False,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
@@ -77,6 +81,9 @@ def build_python_short_run_snapshot(
         use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
         use_sparse=use_sparse,
         preload_cache_dir=preload_cache_dir,
+        history_retention_steps=history_retention_steps,
+        checkpoint_dir=checkpoint_dir,
+        resume_checkpoint=resume_checkpoint,
         progress_callback=progress_callback,
     )
     result = run_default_full_case_driver(settings=settings)
@@ -94,6 +101,11 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "n_steps_per_stage": preparation.settings.n_steps_per_stage,
             "use_matlab_mileage_endpoints": preparation.settings.use_matlab_mileage_endpoints,
             "use_sparse": preparation.settings.use_sparse,
+            "history_retention_steps": preparation.settings.history_retention_steps,
+            "checkpoint_dir": None
+            if preparation.settings.checkpoint_dir is None
+            else str(preparation.settings.checkpoint_dir),
+            "resume_checkpoint": preparation.settings.resume_checkpoint,
             "preload_cache_dir": None
             if preparation.settings.preload_cache_dir is None
             else str(preparation.settings.preload_cache_dir),
@@ -101,6 +113,12 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
         "preload_cache": {
             "status": result.preload_cache_status,
             "path": None if result.preload_cache_path is None else str(result.preload_cache_path),
+        },
+        "checkpoint": {
+            "status": result.checkpoint_status,
+            "path": None if result.checkpoint_path is None else str(result.checkpoint_path),
+            "resumed": result.resumed_from_checkpoint,
+            "mileage": result.resumed_checkpoint_mileage,
         },
         "preparation": {
             "total_dof": preparation.total_dof,
@@ -125,6 +143,9 @@ def write_full_case_short_run_report(
     plot_every: int = 1,
     save_progress: bool = False,
     preload_cache_dir: str | Path | None = None,
+    history_retention_steps: int | None = 256,
+    checkpoint_dir: str | Path | None = None,
+    resume_checkpoint: bool = False,
     progress_recorder: "_ProgressRecorder | None" = None,
     matlab_baseline_path: str | Path | None = None,
     abs_tolerance: float = DEFAULT_ABS_TOLERANCE,
@@ -144,6 +165,9 @@ def write_full_case_short_run_report(
         use_sparse=use_sparse,
         use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
         preload_cache_dir=preload_cache_dir,
+        history_retention_steps=history_retention_steps,
+        checkpoint_dir=checkpoint_dir,
+        resume_checkpoint=resume_checkpoint,
         progress_callback=progress_writer,
     )
     snapshot_path = output_path / "python_snapshot.json"
@@ -345,6 +369,7 @@ def write_timing_summary(snapshot: dict[str, Any], output_dir: str | Path) -> tu
         "# SDITT Timing Summary",
         "",
         f"- preload cache: `{snapshot.get('preload_cache', {}).get('status', 'unknown')}`",
+        f"- checkpoint: `{snapshot.get('checkpoint', {}).get('status', 'unknown')}`",
         "",
         "| rank | item | seconds |",
         "| ---: | --- | ---: |",
@@ -683,6 +708,8 @@ class _ProgressRecorder:
 
     def __call__(self, event: FullCaseProgressEvent) -> None:
         with self._lock:
+            if self.events and self.events[-1].profile_snapshot is not None:
+                self.events[-1] = replace(self.events[-1], profile_snapshot=None)
             self.events.append(event)
         self._queue.put(event)
 
@@ -710,7 +737,8 @@ class _ProgressRecorder:
         with csv_path.open("w", encoding="utf-8") as handle:
             handle.write(
                 "stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,"
-                f"contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}\n"
+                f"contact_force_norm,total_force_norm,max_patch_force_z,"
+                f"damping_clip_count,damping_clip_max_delta_N{patch_suffix}\n"
             )
             for event in events:
                 patch_values = _patch_force_values(event, len(patch_labels), fallback_max=len(patch_labels) == 1)
@@ -719,10 +747,36 @@ class _ProgressRecorder:
                     f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
                     f"{event.front_mileage:.17g},{event.iterations},{event.step_wall_time:.17g},"
                     f"{event.contact_force_norm:.17g},"
-                    f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}{patch_text}\n"
+                    f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g},"
+                    f"{event.damping_clip_count},{event.damping_clip_max_delta:.17g}{patch_text}\n"
                 )
         svg_path.write_text(self.svg(events), encoding="utf-8")
+        self._write_damping_clip_diagnostics(output_dir, events)
         return csv_path, svg_path
+
+    def _write_damping_clip_diagnostics(self, output_dir: Path, events: tuple[FullCaseProgressEvent, ...]) -> None:
+        rows: list[tuple[FullCaseProgressEvent, dict[str, Any]]] = []
+        for event in events:
+            for diagnostic in event.damping_clip_diagnostics:
+                rows.append((event, diagnostic))
+        if not rows:
+            return
+        path = output_dir / "damping_clips.csv"
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(
+                "stage,step,time,front_mileage,wheelset,side,patch_id,dummy_rail,"
+                "elastic_force_N,raw_damping_force_N,clipped_damping_force_N,relative_velocity_ratio\n"
+            )
+            for event, diagnostic in rows:
+                handle.write(
+                    f"{event.stage},{event.step_index},{event.time:.17g},{event.front_mileage:.17g},"
+                    f"{diagnostic.get('wheelset', '')},{diagnostic.get('side', '')},"
+                    f"{diagnostic.get('patch_id', '')},{diagnostic.get('dummy_rail', '')},"
+                    f"{float(diagnostic.get('elastic_force', 0.0)):.17g},"
+                    f"{float(diagnostic.get('raw_damping_force', 0.0)):.17g},"
+                    f"{float(diagnostic.get('clipped_damping_force', 0.0)):.17g},"
+                    f"{float(diagnostic.get('relative_velocity_ratio', 0.0)):.17g}\n"
+                )
 
     def svg(self, events: Iterable[FullCaseProgressEvent] | None = None) -> str:
         event_list = list(self.snapshot() if events is None else events)
@@ -734,7 +788,8 @@ class _ProgressRecorder:
         patch_columns = ",".join(_patch_force_column(label) for label in patch_labels)
         patch_suffix = f",{patch_columns}" if patch_columns else ""
         lines = [
-            f"stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,contact_force_norm,total_force_norm,max_patch_force_z{patch_suffix}"
+            "stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,"
+            f"contact_force_norm,total_force_norm,max_patch_force_z,damping_clip_count,damping_clip_max_delta_N{patch_suffix}"
         ]
         for event in events:
             patch_values = _patch_force_values(event, len(patch_labels), fallback_max=len(patch_labels) == 1)
@@ -743,7 +798,8 @@ class _ProgressRecorder:
                 f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
                 f"{event.front_mileage:.17g},{event.iterations},{event.step_wall_time:.17g},"
                 f"{event.contact_force_norm:.17g},"
-                f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g}{patch_text}"
+                f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g},"
+                f"{event.damping_clip_count},{event.damping_clip_max_delta:.17g}{patch_text}"
             )
         return "\n".join(lines) + "\n"
 
@@ -1069,13 +1125,14 @@ def _step_wall_times(events: Iterable[FullCaseProgressEvent]) -> np.ndarray:
 
 
 class _LiveProgressWindow:
-    def __init__(self, recorder: _ProgressRecorder, state: dict[str, Any]) -> None:
+    def __init__(self, recorder: _ProgressRecorder, state: dict[str, Any], *, start_callback: Any) -> None:
         import tkinter as tk
         from tkinter import ttk
 
         self.tk = tk
         self.recorder = recorder
         self.state = state
+        self.start_callback = start_callback
         self.root = tk.Tk()
         self.root.title("SDITT Full-Case Progress")
         self.root.geometry("1040x720")
@@ -1083,8 +1140,20 @@ class _LiveProgressWindow:
         self.started_at = time.monotonic()
         self.completed_elapsed: float | None = None
 
+        controls = ttk.Frame(self.root)
+        controls.pack(fill="x", padx=12, pady=(10, 4))
+        self.resume_var = tk.BooleanVar(value=bool(state.get("resume_checkpoint")))
+        self.resume_check = ttk.Checkbutton(
+            controls,
+            text=self._resume_option_text(),
+            variable=self.resume_var,
+            state="normal" if state.get("checkpoint_summary") else "disabled",
+        )
+        self.resume_check.pack(side="left")
+        self.start_button = ttk.Button(controls, text="开始运行", command=self._start_run)
+        self.start_button.pack(side="right")
         self.summary = ttk.Label(self.root, text="Starting...", anchor="w")
-        self.summary.pack(fill="x", padx=12, pady=(10, 4))
+        self.summary.pack(fill="x", padx=12, pady=(0, 4))
         self.progress = ttk.Progressbar(self.root, orient="horizontal", mode="determinate", maximum=100.0)
         self.progress.pack(fill="x", padx=12, pady=(0, 10))
         self.canvas = tk.Canvas(self.root, width=1000, height=580, bg="white", highlightthickness=1, highlightbackground="#c8c8c8")
@@ -1096,6 +1165,26 @@ class _LiveProgressWindow:
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
 
+    def _resume_option_text(self) -> str:
+        summary = self.state.get("checkpoint_summary")
+        if not summary:
+            return "无可用历史存档"
+        return (
+            "从历史存档恢复 "
+            f"({summary.get('stage')} {float(summary.get('front_mileage', 0.0)):.3f} m)"
+        )
+
+    def _start_run(self) -> None:
+        if self.state.get("worker_started"):
+            return
+        self.state["resume_checkpoint"] = bool(self.resume_var.get() and self.state.get("checkpoint_summary"))
+        self.state["worker_started"] = True
+        self.started_at = time.monotonic()
+        self.completed_elapsed = None
+        self.start_button.configure(state="disabled")
+        self.resume_check.configure(state="disabled")
+        self.start_callback()
+
     def run(self) -> None:
         self.root.after(250, self._refresh)
         self.root.mainloop()
@@ -1106,6 +1195,11 @@ class _LiveProgressWindow:
 
     def _refresh(self) -> None:
         events = self.recorder.snapshot()
+        if not self.state.get("worker_started"):
+            self.summary.configure(text="Ready to run.")
+            self.status.configure(text="选择是否使用历史存档，然后点击开始运行。")
+            self.root.after(500, self._refresh)
+            return
         elapsed_seconds = self._elapsed_seconds()
         elapsed_text = _format_elapsed_time(elapsed_seconds)
         timing_text = ""
@@ -1136,7 +1230,9 @@ class _LiveProgressWindow:
                 return
         else:
             suffix = f" Timing: {timing_text}." if timing_text else ""
-            self.status.configure(text=f"Running for {elapsed_text}.{suffix} Close hides the window; the simulation keeps running.")
+            resume = self.state.get("resumed_text", "")
+            prefix = f"{resume} " if resume else ""
+            self.status.configure(text=f"{prefix}Running for {elapsed_text}.{suffix} Close hides the window; the simulation keeps running.")
         self.root.after(500, self._refresh)
 
     def _elapsed_seconds(self) -> float:
@@ -1515,10 +1611,23 @@ class _LiveProgressWindow:
 
 def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -> int:
     recorder = _ProgressRecorder(every=args.plot_every)
-    state: dict[str, Any] = {"done": False, "error": None, "traceback": None, "paths": None}
+    checkpoint_summary = _checkpoint_summary_for_args(args, cut_freq=cut_freq)
+    state: dict[str, Any] = {
+        "done": False,
+        "error": None,
+        "traceback": None,
+        "paths": None,
+        "worker_started": False,
+        "checkpoint_summary": checkpoint_summary,
+        "resume_checkpoint": bool(checkpoint_summary) if args.resume_checkpoint is None else bool(args.resume_checkpoint),
+        "resumed_text": "",
+    }
 
     def worker() -> None:
         try:
+            if state.get("resume_checkpoint") and state.get("checkpoint_summary"):
+                summary = state["checkpoint_summary"]
+                state["resumed_text"] = f"Resumed from checkpoint at {float(summary.get('front_mileage', 0.0)):.3f} m."
             state["paths"] = write_full_case_short_run_report(
                 args.output_dir,
                 cut_freq=cut_freq,
@@ -1530,6 +1639,9 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 plot_every=args.plot_every,
                 save_progress=True,
                 preload_cache_dir=args.preload_cache_dir,
+                history_retention_steps=args.history_retention_steps,
+                checkpoint_dir=args.checkpoint_dir,
+                resume_checkpoint=bool(state.get("resume_checkpoint")),
                 progress_recorder=recorder,
                 matlab_baseline_path=args.matlab_baseline,
                 abs_tolerance=args.abs_tol,
@@ -1538,14 +1650,25 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
         except Exception as exc:  # pragma: no cover - exercised manually with GUI failures.
             state["error"] = f"{type(exc).__name__}: {exc}"
             state["traceback"] = traceback.format_exc()
+            if recorder.snapshot():
+                try:
+                    recorder.write_outputs(args.output_dir)
+                except Exception:
+                    pass
         finally:
             state["done"] = True
 
-    thread = threading.Thread(target=worker, name="sditt-full-case-runner")
-    thread.start()
-    window = _LiveProgressWindow(recorder, state)
+    thread: threading.Thread | None = None
+
+    def start_worker() -> None:
+        nonlocal thread
+        thread = threading.Thread(target=worker, name="sditt-full-case-runner")
+        thread.start()
+
+    window = _LiveProgressWindow(recorder, state, start_callback=start_worker)
     window.run()
-    thread.join()
+    if thread is not None:
+        thread.join()
     if state.get("traceback"):
         print(state["traceback"])
     paths = state.get("paths")
@@ -1556,12 +1679,34 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
     return 1 if state.get("error") else 0
 
 
+def _checkpoint_summary_for_args(args: argparse.Namespace, *, cut_freq: float | None) -> dict[str, Any] | None:
+    if args.checkpoint_dir is None:
+        return None
+    settings = FullDefaultCaseSettings(
+        cut_freq=cut_freq,
+        dt=args.dt,
+        n_steps_per_stage=args.steps,
+        use_matlab_mileage_endpoints=args.matlab_mileage_endpoints,
+        use_sparse=not args.dense,
+        preload_cache_dir=args.preload_cache_dir,
+        history_retention_steps=args.history_retention_steps,
+        checkpoint_dir=args.checkpoint_dir,
+        resume_checkpoint=False,
+    )
+    return find_default_full_case_checkpoint(settings=settings)
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, allow_nan=False)
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _history_retention_arg(value: str) -> int | None:
+    parsed = int(value)
+    return None if parsed <= 0 else parsed
 
 
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -1587,6 +1732,32 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Cache completed Preload state here and reuse it for identical input settings.",
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR / "checkpoints",
+        help="Save/resume latest matching run checkpoint here.",
+    )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume-checkpoint",
+        dest="resume_checkpoint",
+        action="store_true",
+        default=None,
+        help="Resume from the latest matching run checkpoint when available.",
+    )
+    resume_group.add_argument(
+        "--no-resume-checkpoint",
+        dest="resume_checkpoint",
+        action="store_false",
+        help="Ignore matching run checkpoints and start from the beginning.",
+    )
+    parser.add_argument(
+        "--history-retention-steps",
+        type=_history_retention_arg,
+        default=256,
+        help="Retain only this many recent full-state diagnostic steps in memory; use 0 to keep all.",
+    )
     parser.add_argument("--plot-every", type=int, default=1, help="Reserved progress refresh interval; final files are written once.")
     parser.add_argument("--abs-tol", type=float, default=DEFAULT_ABS_TOLERANCE)
     parser.add_argument("--rel-tol", type=float, default=DEFAULT_REL_TOLERANCE)
@@ -1609,6 +1780,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         plot_every=args.plot_every,
         save_progress=args.save_progress,
         preload_cache_dir=args.preload_cache_dir,
+        history_retention_steps=args.history_retention_steps,
+        checkpoint_dir=args.checkpoint_dir,
+        resume_checkpoint=bool(args.resume_checkpoint),
         matlab_baseline_path=args.matlab_baseline,
         abs_tolerance=args.abs_tol,
         rel_tolerance=args.rel_tol,

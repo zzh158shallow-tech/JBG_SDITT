@@ -15,6 +15,7 @@ from .geometry import (
 )
 from .forces import (
     KalkerTangentialForceResult,
+    NormalDampingClipDiagnostic,
     StripePatchResult,
     StripesNormalForceResult,
     add_hu_guo_stripes_damping,
@@ -38,6 +39,7 @@ __all__ = [
     "FullCaseWheelRailContactResult",
     "KalkerTangentialForceResult",
     "MultiPointContactGeometry",
+    "NormalDampingClipDiagnostic",
     "SinglePointContact",
     "StripePatchResult",
     "StripesNormalForceResult",

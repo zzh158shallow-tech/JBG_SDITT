@@ -186,6 +186,46 @@ def test_add_hu_guo_stripes_damping_sets_elastic_damping_and_total_columns() -> 
     assert np.isclose(damped.normal_force[0, 0], damped.normal_force[0, 4] + damped.normal_force[0, 5])
 
 
+def test_add_hu_guo_stripes_damping_clips_negative_damping_to_elastic_force() -> None:
+    y = np.linspace(-0.02, 0.02, 81)
+    elastic = stripes_normal_force(
+        np.array([[-0.03, 0.43], [0.03, 0.43]], dtype=float),
+        np.array([[-0.03, 1.0], [0.03, 1.0]], dtype=float),
+        np.array([[0.0, 0.0, 0.43]], dtype=float),
+        np.array([[0.0, 0.0, 0.43, 0.0, 1.0e-5, 0.0]], dtype=float),
+        np.array([[0.0, 0.43]], dtype=float),
+        np.column_stack((np.zeros_like(y), y, np.full_like(y, 0.43))),
+        np.column_stack((y, np.full_like(y, 0.43))),
+        wheel_lateral=0.0,
+        wheel_to_track=np.eye(3),
+        contact_to_track=np.eye(3),
+        penetration_peaks=np.array([[40.0, 0.0, 1.0e-5, 0.0]], dtype=float),
+        m=np.array([2.0]),
+        n=np.array([0.5]),
+        con_a=np.array([1.0]),
+        con_b=np.array([2.0]),
+        con_r=np.array([0.8]),
+        elastic_modulus=2.06e11,
+        poisson_ratio=0.3,
+        stripe_count=11,
+        correction="AB",
+    )
+
+    damped = add_hu_guo_stripes_damping(
+        elastic,
+        relative_velocity_ratio=-10.0,
+        restitution_coefficient=0.5,
+    )
+
+    assert np.isclose(damped.normal_force[0, 5], -elastic.normal_force[0, 4])
+    assert np.isclose(damped.normal_force[0, 0], 0.0)
+    assert len(damped.damping_clip_diagnostics) == 1
+    diagnostic = damped.damping_clip_diagnostics[0]
+    assert diagnostic.patch_index == 0
+    assert diagnostic.raw_damping_force < -diagnostic.elastic_force
+    assert np.isclose(diagnostic.clipped_damping_force, -diagnostic.elastic_force)
+
+
 def test_normal_damping_window_matches_face_and_trail_tables() -> None:
     assert normal_damping_window(20.0, "Face") == 0.0
     assert normal_damping_window(100.0, "Face") == 1.0

@@ -28,6 +28,7 @@ from .full_case import (
     FullDefaultCaseStageResult,
     MissingFullCasePhysicsError,
     MissingFullCaseStage,
+    find_default_full_case_checkpoint,
     prepare_default_full_case,
     run_default_full_case_driver,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "assemble_system_matrices",
     "build_default_modal_rw_system_matrices",
     "build_default_sparse_modal_rw_system_matrices",
+    "find_default_full_case_checkpoint",
     "prepare_default_full_case",
     "run_coupled_time_iteration",
     "run_default_full_case_driver",

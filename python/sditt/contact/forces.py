@@ -10,6 +10,17 @@ from sditt.profiles.geometry import contact_tables
 
 
 @dataclass(frozen=True)
+class NormalDampingClipDiagnostic:
+    """One Hu-Guo damping clip event for a STRIPES contact patch."""
+
+    patch_index: int
+    elastic_force: float
+    raw_damping_force: float
+    clipped_damping_force: float
+    relative_velocity_ratio: float
+
+
+@dataclass(frozen=True)
 class StripePatchResult:
     """STRIPES normal-force details for one contact patch."""
 
@@ -35,6 +46,7 @@ class StripesNormalForceResult:
     area: np.ndarray
     epsilon: np.ndarray
     patches: tuple[StripePatchResult, ...]
+    damping_clip_diagnostics: tuple[NormalDampingClipDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -364,9 +376,11 @@ def add_hu_guo_stripes_damping(
     if ratios.shape != (normal_force.shape[0],):
         raise ValueError("relative_velocity_ratio must be scalar or one value per contact patch")
 
+    diagnostics: list[NormalDampingClipDiagnostic] = []
     for i, patch in enumerate(result.patches):
+        elastic_force = float(normal_force[i, 4])
         if patch.stripes.size == 0:
-            normal_force[i, 5] = 0.0
+            raw_damping = 0.0
         else:
             stripe_damping = hu_guo_normal_damping_force(
                 patch.stripes[:, 0],
@@ -374,7 +388,19 @@ def add_hu_guo_stripes_damping(
                 ratios[i],
                 restitution_coefficient,
             )
-            normal_force[i, 5] = float(np.sum(stripe_damping) * win)
+            raw_damping = float(np.sum(stripe_damping) * win)
+        clipped_damping = max(raw_damping, -elastic_force)
+        if clipped_damping != raw_damping:
+            diagnostics.append(
+                NormalDampingClipDiagnostic(
+                    patch_index=i,
+                    elastic_force=elastic_force,
+                    raw_damping_force=raw_damping,
+                    clipped_damping_force=clipped_damping,
+                    relative_velocity_ratio=float(ratios[i]),
+                )
+            )
+        normal_force[i, 5] = clipped_damping
         normal_force[i, 0] = normal_force[i, 4] + normal_force[i, 5]
 
     return StripesNormalForceResult(
@@ -382,6 +408,7 @@ def add_hu_guo_stripes_damping(
         area=result.area.copy(),
         epsilon=result.epsilon.copy(),
         patches=result.patches,
+        damping_clip_diagnostics=tuple(diagnostics),
     )
 
 

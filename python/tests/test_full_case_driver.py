@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ from sditt.simulation import (
     FullCaseFrozenContactInput,
     FullDefaultCaseSettings,
     MissingFullCasePhysicsError,
+    find_default_full_case_checkpoint,
     prepare_default_full_case,
     run_default_full_case_driver,
 )
@@ -363,6 +365,31 @@ def test_preload_cache_reuses_completed_preload_state() -> None:
     assert [event.stage for event in second_events] == ["Preload", "Cal"]
     assert second_events[0].front_mileage == pytest.approx(first_events[0].front_mileage)
     assert all(event.step_wall_time >= 0.0 for event in second_events)
+
+
+def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
+    checkpoint_dir = Path("outputs") / "test_run_checkpoints" / uuid.uuid4().hex
+    settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        stage_end_mileage={"Preload": 32.03, "Cal": 32.12},
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_interval_m=0.05,
+        history_retention_steps=None,
+    )
+
+    first = run_default_full_case_driver(settings=settings)
+    summary = find_default_full_case_checkpoint(settings=settings)
+    resumed = run_default_full_case_driver(settings=replace(settings, resume_checkpoint=True))
+
+    assert first.checkpoint_status == "saved"
+    assert first.checkpoint_path is not None
+    assert first.checkpoint_path.exists()
+    assert summary is not None
+    assert summary["stage"] in {"Preload", "Cal"}
+    assert resumed.resumed_from_checkpoint
+    assert resumed.resumed_checkpoint_mileage == pytest.approx(float(summary["front_mileage"]))
+    assert resumed.output_rows[0].front_mileage > float(summary["front_mileage"])
 
 
 def _initial_stage_front_mileage_for_test(result) -> float:

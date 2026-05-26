@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 import numpy as np
@@ -75,6 +75,7 @@ class CoupledStepState:
 class CoupledTimeIterationResult:
     """Accepted coupled response history and iteration metadata."""
 
+    step_index: np.ndarray
     time: np.ndarray
     displacement: np.ndarray
     velocity: np.ndarray
@@ -103,6 +104,9 @@ def run_coupled_time_iteration(
     contact_force0: np.ndarray | None = None,
     settings: CoupledIterationSettings | None = None,
     accepted_step_callback: Callable[[Any], None] | None = None,
+    history_retention_steps: int | None = None,
+    time0: float = 0.0,
+    step_index0: int = 0,
 ) -> CoupledTimeIterationResult:
     """Run the coupled main loop with force convergence and step-size retry.
 
@@ -116,6 +120,10 @@ def run_coupled_time_iteration(
         raise ValueError("dt must be positive")
     if n_steps < 0:
         raise ValueError("n_steps cannot be negative")
+    if history_retention_steps is not None and history_retention_steps <= 0:
+        raise ValueError("history_retention_steps must be positive")
+    if step_index0 < 0:
+        raise ValueError("step_index0 cannot be negative")
     settings = settings or CoupledIterationSettings()
     if settings.min_dt > dt:
         raise ValueError("min_dt cannot exceed dt")
@@ -152,7 +160,8 @@ def run_coupled_time_iteration(
         else initial_acceleration(system, q0, v0, f_ext0 + f_contact)
     )
 
-    time_history = [0.0]
+    step_index_history = [int(step_index0)]
+    time_history = [float(time0)]
     q_history = [q0]
     v_history = [v0]
     a_history = [a0]
@@ -181,7 +190,7 @@ def run_coupled_time_iteration(
             accepted = _attempt_coupled_step(
                 system,
                 callbacks,
-                step_index=accepted_steps + 1,
+                step_index=int(step_index0) + accepted_steps + 1,
                 time_next=time_history[-1] + current_dt,
                 dt=current_dt,
                 q_history=integration_q_history,
@@ -213,13 +222,41 @@ def run_coupled_time_iteration(
         integration_q_history.append(accepted.displacement)
         integration_v_history.append(accepted.velocity)
         integration_a_history.append(accepted.acceleration)
+        if len(integration_q_history) > 3:
+            del integration_q_history[:-3]
+            del integration_v_history[:-3]
+            del integration_a_history[:-3]
         if accepted_step_callback is not None:
-            accepted_step_callback(accepted)
+            accepted_step_callback(
+                replace(
+                    accepted,
+                    displacement_history_seed=_park_history_seed(integration_q_history),
+                    velocity_history_seed=_park_history_seed(integration_v_history),
+                    acceleration_history_seed=_park_history_seed(integration_a_history),
+                )
+            )
         accepted_steps += 1
+        step_index_history.append(accepted.step_index)
+        if history_retention_steps is not None:
+            max_rows = int(history_retention_steps) + 1
+            if len(time_history) > max_rows:
+                drop = len(time_history) - max_rows
+                del step_index_history[:drop]
+                del time_history[:drop]
+                del q_history[:drop]
+                del v_history[:drop]
+                del a_history[:drop]
+                del contact_force_history[:drop]
+                del total_force_history[:drop]
+                del iteration_history[:drop]
+                del dt_history[:drop]
+                del rail_history[:drop]
+                del geometry_history[:drop]
         if settings.reset_dt_after_success:
             current_dt = float(dt)
 
     return CoupledTimeIterationResult(
+        step_index=np.asarray(step_index_history, dtype=int),
         time=np.asarray(time_history, dtype=float),
         displacement=np.vstack(q_history),
         velocity=np.vstack(v_history),
@@ -248,6 +285,9 @@ class _AcceptedStep:
     contact_geometry: Any
     timing: Mapping[str, float] = field(default_factory=dict)
     step_wall_time: float = 0.0
+    displacement_history_seed: np.ndarray | None = None
+    velocity_history_seed: np.ndarray | None = None
+    acceleration_history_seed: np.ndarray | None = None
 
 
 class _StepDidNotConverge(Exception):
@@ -401,3 +441,10 @@ def _as_history_seed(value: np.ndarray | None, ndof: int) -> np.ndarray | None:
     if array.ndim != 2 or array.shape[1] != ndof or array.shape[0] < 1:
         raise ValueError(f"expected history seed with shape (n, {ndof}), got {array.shape}")
     return array.copy()
+
+
+def _park_history_seed(history: list[np.ndarray]) -> np.ndarray:
+    values = np.vstack(history)
+    if values.shape[0] >= 3:
+        return values[-3:, :].copy()
+    return np.repeat(values[-1:, :], 3, axis=0)

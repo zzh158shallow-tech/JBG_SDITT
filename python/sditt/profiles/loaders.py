@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,7 @@ def load_profile_directory(root: str | Path) -> dict[Path, ProfileData]:
     return profiles
 
 
+@lru_cache(maxsize=512)
 def load_profile_file(path: str | Path) -> ProfileData:
     file_path = Path(path)
     if file_path.suffix.lower() in {".prr", ".prw"}:

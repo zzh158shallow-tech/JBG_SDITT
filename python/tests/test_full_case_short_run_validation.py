@@ -140,8 +140,9 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
         "patch_FF_L1_wheel_rail_force_magnitude_N,patch_FF_R1_wheel_rail_force_magnitude_N,"
         "patch_FR_L1_wheel_rail_force_magnitude_N,patch_FR_R1_wheel_rail_force_magnitude_N"
     ) in csv
+    assert "damping_clip_count,damping_clip_max_delta_N" in csv
     assert "Preload,1,2" in csv
-    assert ",130,250,410,510" in csv
+    assert ",0,0,130,250,410,510" in csv
     svg = svg_path.read_text(encoding="utf-8")
     assert "<polyline" in svg
     assert "Mileage (m)" in svg
@@ -156,12 +157,26 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
 
 
 def test_full_case_short_run_validation_parses_live_window_and_save_progress_flags() -> None:
-    args = _parse_args(["--live-window", "--save-progress", "--plot-every", "25", "--preload-cache-dir", "cache"])
+    args = _parse_args(
+        [
+            "--live-window",
+            "--save-progress",
+            "--plot-every",
+            "25",
+            "--preload-cache-dir",
+            "cache",
+            "--checkpoint-dir",
+            "checkpoints",
+            "--resume-checkpoint",
+        ]
+    )
 
     assert args.live_window
     assert args.save_progress
     assert args.plot_every == 25
     assert str(args.preload_cache_dir) == "cache"
+    assert str(args.checkpoint_dir) == "checkpoints"
+    assert args.resume_checkpoint is True
 
 
 def test_format_elapsed_time_uses_stable_clock_format() -> None:
