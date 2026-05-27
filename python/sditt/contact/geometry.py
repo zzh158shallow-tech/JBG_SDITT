@@ -26,6 +26,15 @@ class WheelTrace:
 
 
 @dataclass(frozen=True)
+class PreparedWheelTraceProfile:
+    """Wheel profile samples that do not depend on wheel pose."""
+
+    x_profile: np.ndarray
+    rolling_radius: np.ndarray
+    contact_angles: np.ndarray
+
+
+@dataclass(frozen=True)
 class SinglePointContact:
     """One Hertz-style normal contact geometry result."""
 
@@ -100,19 +109,16 @@ def trace_wheel_profile(
     """
 
     pose = pose or WheelPose2D()
-    profile = _sort_points(wheel_profile)
-    angle_table = _sort_points(contact_angle_table)
-    if dlb is not None:
-        profile = _densify_wheel_profile_for_trace(
-            profile,
-            dlb=float(dlb),
-            discrete_len_flange=discrete_len_flange,
-            discrete_len_tread=discrete_len_tread,
-        )
-
-    x_profile = profile[:, 0]
-    rolling_radius = profile[:, 1]
-    contact_angles = _spline_interp(angle_table[:, 0], angle_table[:, 1], x_profile)
+    prepared = _prepared_wheel_trace_profile(
+        wheel_profile,
+        contact_angle_table,
+        dlb=dlb,
+        discrete_len_flange=discrete_len_flange,
+        discrete_len_tread=discrete_len_tread,
+    )
+    x_profile = prepared.x_profile
+    rolling_radius = prepared.rolling_radius
+    contact_angles = prepared.contact_angles
 
     lx = -np.cos(pose.roll) * np.sin(pose.yaw)
     ly = np.cos(pose.roll) * np.cos(pose.yaw)
@@ -439,6 +445,54 @@ def _wheelset_orientation(roll: float, yaw: float) -> np.ndarray:
 
 def _right_matrix_divide(values: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return np.linalg.solve(np.asarray(matrix, dtype=float).T, np.asarray(values, dtype=float).T).T
+
+
+_WHEEL_TRACE_CACHE_MAX = 16
+_wheel_trace_cache: dict[tuple[int, int, tuple[int, ...], tuple[int, ...], float | None, float, float], PreparedWheelTraceProfile] = {}
+
+
+def _prepared_wheel_trace_profile(
+    wheel_profile: np.ndarray,
+    contact_angle_table: np.ndarray,
+    *,
+    dlb: float | None,
+    discrete_len_flange: float,
+    discrete_len_tread: float,
+) -> PreparedWheelTraceProfile:
+    profile_array = np.asarray(wheel_profile, dtype=float)
+    angle_array = np.asarray(contact_angle_table, dtype=float)
+    cache_key = (
+        id(wheel_profile),
+        id(contact_angle_table),
+        profile_array.shape,
+        angle_array.shape,
+        None if dlb is None else float(dlb),
+        float(discrete_len_flange),
+        float(discrete_len_tread),
+    )
+    cached = _wheel_trace_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    profile = _sort_points(profile_array)
+    angle_table = _sort_points(angle_array)
+    if dlb is not None:
+        profile = _densify_wheel_profile_for_trace(
+            profile,
+            dlb=float(dlb),
+            discrete_len_flange=discrete_len_flange,
+            discrete_len_tread=discrete_len_tread,
+        )
+
+    prepared = PreparedWheelTraceProfile(
+        x_profile=profile[:, 0],
+        rolling_radius=profile[:, 1],
+        contact_angles=_spline_interp(angle_table[:, 0], angle_table[:, 1], profile[:, 0]),
+    )
+    if len(_wheel_trace_cache) >= _WHEEL_TRACE_CACHE_MAX:
+        _wheel_trace_cache.pop(next(iter(_wheel_trace_cache)))
+    _wheel_trace_cache[cache_key] = prepared
+    return prepared
 
 
 def _densify_wheel_profile_for_trace(

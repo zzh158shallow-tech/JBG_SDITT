@@ -747,12 +747,19 @@ def _smooth_lowess(values: np.ndarray, *, span: int) -> np.ndarray:
         if np.count_nonzero(active) < 2:
             out[i] = float(y_fit[np.argmin(distances)])
             continue
-        design = np.column_stack((np.ones(np.count_nonzero(active)), x_fit[active] - float(i)))
-        sqrt_weights = np.sqrt(weights[active])
-        weighted_design = design * sqrt_weights[:, np.newaxis]
-        weighted_y = y_fit[active] * sqrt_weights
-        coefficients, *_ = np.linalg.lstsq(weighted_design, weighted_y, rcond=None)
-        out[i] = float(coefficients[0])
+        x_active = x_fit[active] - float(i)
+        y_active = y_fit[active]
+        w_active = weights[active]
+        sum_w = float(np.sum(w_active))
+        sum_x = float(np.sum(w_active * x_active))
+        sum_y = float(np.sum(w_active * y_active))
+        sum_xx = float(np.sum(w_active * x_active * x_active))
+        sum_xy = float(np.sum(w_active * x_active * y_active))
+        denominator = sum_w * sum_xx - sum_x * sum_x
+        if abs(denominator) <= np.finfo(float).eps:
+            out[i] = float(y_fit[np.argmin(distances)])
+        else:
+            out[i] = (sum_xx * sum_y - sum_x * sum_xy) / denominator
     return out
 
 

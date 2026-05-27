@@ -78,10 +78,32 @@ virtual environment from the setup section, activate it first:
 - Full MATLAB-mileage endpoint run with realtime window:
   - `cd python`
   - `python -m sditt.validation.full_case_short_run --live-window --full-size --matlab-mileage-endpoints`
-- Mac full MATLAB-mileage endpoint run with realtime window, progress saving,
-  and checkpoints:
-  - `cd /Users/zhou/Documents/Codex/SDITT/python`
-  - `./.venv/bin/python -m sditt.validation.full_case_short_run --live-window --full-size --matlab-mileage-endpoints --save-progress --checkpoint-dir outputs/full_case_short_run/checkpoints --no-resume-checkpoint`
+- Full MATLAB-mileage endpoint run with realtime window, final progress output,
+  and run checkpoints:
+  - Windows PowerShell:
+    - `cd G:\codex_program\sditt_py\python`
+    - ```powershell
+      .\.venv\Scripts\python.exe -m sditt.validation.full_case_short_run `
+        --live-window `
+        --full-size `
+        --matlab-mileage-endpoints `
+        --save-progress `
+        --checkpoint-dir G:\codex_program\sditt_py\python\outputs\full_case_short_run\checkpoints `
+        --no-resume-checkpoint
+      ```
+  - macOS/Linux shell:
+    - `cd /path/to/SDITT/python`
+    - ```bash
+      ./.venv/bin/python -m sditt.validation.full_case_short_run \
+        --live-window \
+        --full-size \
+        --matlab-mileage-endpoints \
+        --save-progress \
+        --checkpoint-dir /path/to/SDITT/python/outputs/full_case_short_run/checkpoints \
+        --no-resume-checkpoint
+      ```
+  - Replace `--no-resume-checkpoint` with `--resume-checkpoint` to continue
+    from the latest matching checkpoint.
 - Save final progress CSV/SVG without GUI:
   - `cd python`
   - `python -m sditt.validation.full_case_short_run --save-progress --steps 2 --cut-freq 50`

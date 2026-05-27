@@ -10,6 +10,7 @@ from sditt.validation.full_case_short_run import (
     _format_elapsed_time,
     _format_timing_top,
     _parse_args,
+    _sample_progress_events,
     _step_wall_times,
     build_full_case_short_run_report,
     build_python_short_run_snapshot,
@@ -227,3 +228,30 @@ def test_step_wall_times_uses_progress_event_values() -> None:
     )
 
     assert np.allclose(_step_wall_times(events), [1.25, 0.5])
+
+
+def test_sample_progress_events_keeps_latest_event() -> None:
+    events = tuple(
+        FullCaseProgressEvent(
+            stage="Cal",
+            step_index=index,
+            n_steps=2505,
+            time=float(index),
+            dt=1.0e-4,
+            front_mileage=float(index),
+            iterations=1,
+            normal_error=0.0,
+            normal_tangential_error=0.0,
+            contact_force_norm=1.0,
+            total_force_norm=2.0,
+            max_patch_force_z=3.0,
+        )
+        for index in range(2505)
+    )
+
+    sampled = _sample_progress_events(events, max_points=2000)
+
+    assert len(sampled) <= 2000
+    assert sampled[0] is events[0]
+    assert sampled[-1] is events[-1]
+    assert [event.step_index for event in sampled] == sorted(event.step_index for event in sampled)

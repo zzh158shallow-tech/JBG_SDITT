@@ -21,6 +21,7 @@ from sditt.simulation import (
     prepare_default_full_case,
     run_default_full_case_driver,
 )
+from sditt.simulation.full_case import _matlab_mileage_step_dt, _stage_step_count
 from sditt.track import rail_dyn_modal_ft, wr_force_modal_ft
 from sditt.vehicle import build_nonlinear_damper_response, wr_force_vehicle_sys_rotation_iii
 
@@ -369,6 +370,8 @@ def test_preload_cache_reuses_completed_preload_state() -> None:
 
 def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
     checkpoint_dir = Path("outputs") / "test_run_checkpoints" / uuid.uuid4().hex
+    first_events = []
+    resumed_events = []
     settings = FullDefaultCaseSettings(
         cut_freq=50.0,
         dt=1.0e-4,
@@ -378,9 +381,11 @@ def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
         history_retention_steps=None,
     )
 
-    first = run_default_full_case_driver(settings=settings)
+    first = run_default_full_case_driver(settings=replace(settings, progress_callback=first_events.append))
     summary = find_default_full_case_checkpoint(settings=settings)
-    resumed = run_default_full_case_driver(settings=replace(settings, resume_checkpoint=True))
+    resumed = run_default_full_case_driver(
+        settings=replace(settings, resume_checkpoint=True, progress_callback=resumed_events.append)
+    )
 
     assert first.checkpoint_status == "saved"
     assert first.checkpoint_path is not None
@@ -390,6 +395,11 @@ def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
     assert resumed.resumed_from_checkpoint
     assert resumed.resumed_checkpoint_mileage == pytest.approx(float(summary["front_mileage"]))
     assert resumed.output_rows[0].front_mileage > float(summary["front_mileage"])
+    replayed = first_events[: len(resumed_events) - len(resumed.output_rows)]
+    assert replayed
+    assert [event.front_mileage for event in resumed_events[: len(replayed)]] == pytest.approx(
+        [event.front_mileage for event in replayed]
+    )
 
 
 def _initial_stage_front_mileage_for_test(result) -> float:
@@ -496,6 +506,29 @@ def test_run_default_full_case_driver_strict_mode_still_rejects_curve_route() ->
             ),
             operating_case=DefaultOperatingCase(layout_type="Curve"),
         )
+
+
+def test_matlab_mileage_step_dt_matches_crossing_small_step_windows() -> None:
+    preparation = prepare_default_full_case(settings=FullDefaultCaseSettings(cut_freq=50.0))
+
+    assert _matlab_mileage_step_dt(preparation, 59.9, 1.0e-4) == pytest.approx(1.0e-4)
+    assert _matlab_mileage_step_dt(preparation, 60.0, 1.0e-4) == pytest.approx(5.0e-5)
+    assert _matlab_mileage_step_dt(preparation, 104.0, 1.0e-4) == pytest.approx(2.5e-5)
+    assert _matlab_mileage_step_dt(preparation, 105.0, 1.0e-4) == pytest.approx(5.0e-5)
+
+
+def test_stage_step_count_accounts_for_matlab_mileage_small_steps() -> None:
+    preparation = prepare_default_full_case(
+        settings=FullDefaultCaseSettings(
+            cut_freq=50.0,
+            dt=1.0e-4,
+            stage_end_mileage={"Cal": 104.01},
+        )
+    )
+
+    steps = _stage_step_count(preparation, "Cal", 103.99)
+
+    assert steps > int(np.ceil((104.01 - 103.99) / (preparation.operating_case.vlc * preparation.settings.dt)))
 
 
 @pytest.mark.skipif(

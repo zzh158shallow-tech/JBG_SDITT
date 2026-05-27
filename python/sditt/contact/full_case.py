@@ -19,6 +19,10 @@ from sditt.contact.geometry import WheelPose2D, multi_point_contact_geometry, si
 from sditt.profiles.geometry import TrackProfileSet, WheelProfileSet, build_track_profiles, contact_tables, offset_profile_to_track
 
 
+_ELLIPTIC_INTEGRAL_PHI = np.linspace(0.0, pi / 2.0, 2001)
+_ELLIPTIC_INTEGRAL_SIN2 = np.sin(_ELLIPTIC_INTEGRAL_PHI) ** 2
+
+
 @dataclass(frozen=True)
 class DefaultTrackContactParameters:
     br: float = 0.7175
@@ -872,8 +876,10 @@ def _hertz_parameters(
         major = max(a1[i], b1[i])
         minor = min(a1[i], b1[i])
         psi = max(minor / max(major, np.finfo(float).eps), 1.0e-6)
-        phi = np.linspace(0.0, pi / 2.0, 2001)
-        temp = np.trapezoid(1.0 / np.sqrt(1.0 - (1.0 - psi**2) * np.sin(phi) ** 2), phi)
+        temp = np.trapezoid(
+            1.0 / np.sqrt(1.0 - (1.0 - psi**2) * _ELLIPTIC_INTEGRAL_SIN2),
+            _ELLIPTIC_INTEGRAL_PHI,
+        )
         elastic_permeability[i] = 3.0 * (1.0 - poisson_ratio**2) / (pi * elastic_modulus * max(major, np.finfo(float).eps)) * temp
     return m, n, elastic_permeability, con_a, con_b, con_r
 

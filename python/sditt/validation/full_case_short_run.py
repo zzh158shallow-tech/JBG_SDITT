@@ -8,7 +8,7 @@ import time
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
@@ -717,6 +717,10 @@ class _ProgressRecorder:
         with self._lock:
             return tuple(self.events)
 
+    def sampled_snapshot(self, max_points: int) -> tuple[FullCaseProgressEvent, ...]:
+        with self._lock:
+            return _sample_progress_events(self.events, max_points=max_points)
+
     def drain(self) -> tuple[FullCaseProgressEvent, ...]:
         drained: list[FullCaseProgressEvent] = []
         while True:
@@ -736,7 +740,7 @@ class _ProgressRecorder:
         patch_suffix = f",{patch_columns}" if patch_columns else ""
         with csv_path.open("w", encoding="utf-8") as handle:
             handle.write(
-                "stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,"
+                "stage,step,n_steps,time,dt,front_mileage,iterations,retry_count,step_wall_time,"
                 f"contact_force_norm,total_force_norm,max_patch_force_z,"
                 f"damping_clip_count,damping_clip_max_delta_N{patch_suffix}\n"
             )
@@ -745,7 +749,7 @@ class _ProgressRecorder:
                 patch_text = "".join(f",{value:.17g}" for value in patch_values)
                 handle.write(
                     f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
-                    f"{event.front_mileage:.17g},{event.iterations},{event.step_wall_time:.17g},"
+                    f"{event.front_mileage:.17g},{event.iterations},{event.retry_count},{event.step_wall_time:.17g},"
                     f"{event.contact_force_norm:.17g},"
                     f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g},"
                     f"{event.damping_clip_count},{event.damping_clip_max_delta:.17g}{patch_text}\n"
@@ -788,7 +792,7 @@ class _ProgressRecorder:
         patch_columns = ",".join(_patch_force_column(label) for label in patch_labels)
         patch_suffix = f",{patch_columns}" if patch_columns else ""
         lines = [
-            "stage,step,n_steps,time,dt,front_mileage,iterations,step_wall_time,"
+            "stage,step,n_steps,time,dt,front_mileage,iterations,retry_count,step_wall_time,"
             f"contact_force_norm,total_force_norm,max_patch_force_z,damping_clip_count,damping_clip_max_delta_N{patch_suffix}"
         ]
         for event in events:
@@ -796,7 +800,7 @@ class _ProgressRecorder:
             patch_text = "".join(f",{value:.17g}" for value in patch_values)
             lines.append(
                 f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
-                f"{event.front_mileage:.17g},{event.iterations},{event.step_wall_time:.17g},"
+                f"{event.front_mileage:.17g},{event.iterations},{event.retry_count},{event.step_wall_time:.17g},"
                 f"{event.contact_force_norm:.17g},"
                 f"{event.total_force_norm:.17g},{event.max_patch_force_z:.17g},"
                 f"{event.damping_clip_count},{event.damping_clip_max_delta:.17g}{patch_text}"
@@ -845,7 +849,7 @@ class _ProgressRecorder:
         parts.append(
             f'<text x="24" y="{height - 24}" font-family="Arial" font-size="13" fill="#404040">'
             f"latest: {last.stage} step {last.step_index}/{last.n_steps}, mileage {last.front_mileage:.6f} m, "
-            f"iterations {last.iterations}</text>"
+            f"iterations {last.iterations}, retries {last.retry_count}</text>"
         )
         parts.append("</svg>")
         return "\n".join(parts)
@@ -1124,6 +1128,19 @@ def _step_wall_times(events: Iterable[FullCaseProgressEvent]) -> np.ndarray:
     return np.asarray([max(0.0, float(getattr(event, "step_wall_time", 0.0) or 0.0)) for event in events], dtype=float)
 
 
+def _sample_progress_events(events: Sequence[FullCaseProgressEvent], *, max_points: int) -> tuple[FullCaseProgressEvent, ...]:
+    limit = max(1, int(max_points))
+    event_count = len(events)
+    if event_count <= limit:
+        return tuple(events)
+    indexes = np.linspace(0, event_count - 1, limit, dtype=int)
+    indexes[-1] = event_count - 1
+    return tuple(events[int(index)] for index in np.unique(indexes))
+
+
+_LIVE_DISPLAY_MAX_POINTS = 2000
+
+
 class _LiveProgressWindow:
     def __init__(self, recorder: _ProgressRecorder, state: dict[str, Any], *, start_callback: Any) -> None:
         import tkinter as tk
@@ -1194,7 +1211,7 @@ class _LiveProgressWindow:
         self.root.withdraw()
 
     def _refresh(self) -> None:
-        events = self.recorder.snapshot()
+        events = self.recorder.sampled_snapshot(_LIVE_DISPLAY_MAX_POINTS)
         if not self.state.get("worker_started"):
             self.summary.configure(text="Ready to run.")
             self.status.configure(text="选择是否使用历史存档，然后点击开始运行。")
@@ -1213,7 +1230,7 @@ class _LiveProgressWindow:
                     f"{latest.stage} step {latest.step_index}/{latest.n_steps} | "
                     f"elapsed {elapsed_text} | "
                     f"mileage {latest.front_mileage:.6f} m | time {latest.time:.6g} s | "
-                    f"iterations {latest.iterations}"
+                    f"iterations {latest.iterations} | retries {latest.retry_count}"
                 )
             )
             self._draw(events)
@@ -1297,6 +1314,7 @@ class _LiveProgressWindow:
                 height=step_plot_height,
                 title="Step wall time",
                 y_label="Seconds/step",
+                latest_marker="※",
             )
             self._draw_profile_panel(
                 events[-1].profile_snapshot,
@@ -1401,6 +1419,7 @@ class _LiveProgressWindow:
         height: int,
         title: str,
         y_label: str,
+        latest_marker: str | None = None,
     ) -> None:
         x0, x1 = _plot_range(xs)
         y0, y1 = _plot_range(ys)
@@ -1429,6 +1448,14 @@ class _LiveProgressWindow:
             self.canvas.create_line(*points, fill="#1f77b4", width=2)
         elif len(points) == 2:
             self.canvas.create_oval(points[0] - 3, points[1] - 3, points[0] + 3, points[1] + 3, fill="#1f77b4", outline="")
+        latest_marker_point: tuple[float, float] | None = None
+        if latest_marker:
+            finite = np.flatnonzero(np.isfinite(xs) & np.isfinite(ys))
+            if finite.size:
+                latest_index = int(finite[-1])
+                px = x + (float(xs[latest_index]) - x0) / (x1 - x0) * width
+                py = y + height - (float(ys[latest_index]) - y0) / (y1 - y0) * height
+                latest_marker_point = (px, py)
         previous_stage = stages[0] if stages else ""
         for index, stage in enumerate(stages):
             if index == 0 or stage == previous_stage:
@@ -1438,6 +1465,15 @@ class _LiveProgressWindow:
             self.canvas.create_line(px, y, px, y + height, fill="#8a8a8a", dash=(4, 4))
             self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=("Arial", 11), fill="#555555")
             previous_stage = stage
+        if latest_marker and latest_marker_point is not None:
+            self.canvas.create_text(
+                latest_marker_point[0],
+                latest_marker_point[1],
+                text=latest_marker,
+                anchor="center",
+                font=("Arial", 16, "bold"),
+                fill="#d62728",
+            )
 
     def _draw_profile_panel(
         self,

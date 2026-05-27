@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from math import comb
 from pathlib import Path
@@ -12,6 +13,8 @@ from sditt.profiles.loaders import load_profile_file
 
 
 WHEEL_STATIONS = ("FF", "FR", "RF", "RR")
+_RADIUS_CACHE_MAX = 2048
+_radius_profile_cache: dict[tuple[tuple[int, ...], str, float, bytes], np.ndarray] = {}
 
 
 @dataclass(frozen=True)
@@ -595,8 +598,25 @@ def _rail_record(
         rear_profile=rear,
         front_extreme=extreme_points(front),
         rear_extreme=extreme_points(rear),
-        radius=_absolute_radius_profile_v3(profile, radius_smoothing),
+        radius=_cached_absolute_radius_profile_v3(profile, radius_smoothing),
     )
+
+
+def _cached_absolute_radius_profile_v3(profile: np.ndarray, radius_smoothing: float) -> np.ndarray:
+    profile_array = np.asarray(profile, dtype=float)
+    if profile_array.size == 0:
+        return np.empty((0, 2), dtype=float)
+    contiguous = np.ascontiguousarray(profile_array)
+    digest = hashlib.blake2b(contiguous.view(np.uint8), digest_size=16).digest()
+    cache_key = (contiguous.shape, contiguous.dtype.str, float(radius_smoothing), digest)
+    cached = _radius_profile_cache.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    radius = _absolute_radius_profile_v3(contiguous, radius_smoothing)
+    if len(_radius_profile_cache) >= _RADIUS_CACHE_MAX:
+        _radius_profile_cache.pop(next(iter(_radius_profile_cache)))
+    _radius_profile_cache[cache_key] = radius.copy()
+    return radius
 
 
 def _absolute_radius_profile_v3(profile: np.ndarray, radius_smoothing: float) -> np.ndarray:

@@ -44,7 +44,13 @@ from sditt.vehicle import (
     wr_force_vehicle_sys_rotation_iii,
 )
 
-from .coupled import CoupledIterationSettings, CoupledStepCallbacks, CoupledStepState, CoupledTimeIterationResult
+from .coupled import (
+    CoupledIterationSettings,
+    CoupledStepCallbacks,
+    CoupledStepState,
+    CoupledTimeIterationResult,
+    StepDtCallback,
+)
 from .coupled import run_coupled_time_iteration
 from .system import (
     SparseSystemMatrices,
@@ -102,6 +108,7 @@ class FullCaseProgressEvent:
     profile_snapshot: FullCaseProfileSnapshot | None = None
     timing: Mapping[str, float] = field(default_factory=dict)
     step_wall_time: float = 0.0
+    retry_count: int = 0
     damping_clip_count: int = 0
     damping_clip_max_delta: float = 0.0
     damping_clip_diagnostics: tuple[dict[str, Any], ...] = ()
@@ -131,8 +138,8 @@ class FullDefaultCaseSettings:
     resume_checkpoint: bool = False
     checkpoint_interval_m: float | None = 10.0
     iteration_settings: CoupledIterationSettings = CoupledIterationSettings(
-        max_iterations=30,
-        force_tolerance=1.0e-3,
+        max_iterations=11,
+        force_tolerance=2.5e-3,
         absolute_force_tolerance=1.0e-6,
         relaxation=1.0,
     )
@@ -515,6 +522,7 @@ def _write_run_checkpoint(
     stage: SimulationStage,
     original_stage_start_front_mileage: float,
     accepted: Any,
+    progress_events: tuple[FullCaseProgressEvent, ...] = (),
 ) -> None:
     rail = accepted.rail_response
     geometry = accepted.contact_geometry
@@ -536,6 +544,7 @@ def _write_run_checkpoint(
             "displacement_history_seed": _copy_cached_array(accepted.displacement_history_seed),
             "velocity_history_seed": _copy_cached_array(accepted.velocity_history_seed),
             "acceleration_history_seed": _copy_cached_array(accepted.acceleration_history_seed),
+            "progress_events": tuple(progress_events),
         },
     }
     with checkpoint_path.open("wb") as handle:
@@ -581,6 +590,12 @@ def _copy_cached_array(value: np.ndarray | None) -> np.ndarray | None:
     if value is None:
         return None
     return np.asarray(value, dtype=float).copy()
+
+
+def _append_progress_event_history(events: list[FullCaseProgressEvent], event: FullCaseProgressEvent) -> None:
+    if events and events[-1].profile_snapshot is not None:
+        events[-1] = replace(events[-1], profile_snapshot=None)
+    events.append(event)
 
 
 def prepare_default_full_case(
@@ -717,6 +732,7 @@ def run_default_full_case_driver(
     resumed_checkpoint_mileage: float | None = None
     stages_to_run = tuple(preparation.operating_case.simulation_stages)
     preload_progress_events: list[FullCaseProgressEvent] = []
+    checkpoint_progress_events: list[FullCaseProgressEvent] = []
     if checkpoint_path is not None and preparation.settings.resume_checkpoint and preparation.settings.frozen_contact_input is None:
         checkpoint = _load_run_checkpoint(preparation, checkpoint_path)
         if checkpoint is not None:
@@ -733,6 +749,10 @@ def run_default_full_case_driver(
             displacement_history_seed = _copy_cached_array(checkpoint["displacement_history_seed"])
             velocity_history_seed = _copy_cached_array(checkpoint["velocity_history_seed"])
             acceleration_history_seed = _copy_cached_array(checkpoint["acceleration_history_seed"])
+            checkpoint_progress_events = list(tuple(checkpoint.get("progress_events", ())))
+            if preparation.settings.progress_callback is not None:
+                for event in tuple(checkpoint_progress_events):
+                    preparation.settings.progress_callback(event)
             if resume_stage == "Preload":
                 stages_to_run = tuple(preparation.operating_case.simulation_stages)
             else:
@@ -757,6 +777,8 @@ def run_default_full_case_driver(
             if preparation.settings.progress_callback is not None:
                 for event in tuple(cached.get("preload_events", ())):
                     preparation.settings.progress_callback(event)
+            for event in tuple(cached.get("preload_events", ())):
+                _append_progress_event_history(checkpoint_progress_events, event)
             stages_to_run = tuple(stage for stage in stages_to_run if stage != "Preload")
 
     for stage in stages_to_run:
@@ -778,13 +800,19 @@ def run_default_full_case_driver(
             contact_state=contact_state,
             stage_start_front_mileage=stage_start_front_mileage,
         )
+        step_dt_callback = _stage_step_dt_callback(
+            preparation,
+            stage,
+            original_stage_start_front_mileage=original_stage_start_front_mileage,
+        )
         if stage_step_index0 == 0:
+            first_step_dt = step_dt_callback(stage_step_index0 + 1, stage_time0, preparation.settings.dt)
             contact_force = _contact_force_from_contact_state(
                 preparation,
                 stage,
                 displacement,
                 velocity,
-                current_front_mileage + preparation.operating_case.vlc * preparation.settings.dt,
+                current_front_mileage + preparation.operating_case.vlc * first_step_dt,
                 contact_state,
             )
         stage_steps = _stage_step_count(preparation, stage, current_front_mileage)
@@ -792,11 +820,26 @@ def run_default_full_case_driver(
         if stage_steps == 0:
             stage_start_front_mileage = current_front_mileage
             continue
-        progress_mirror = (
-            preload_progress_events.append
-            if stage == "Preload" and preload_cache_path is not None and preparation.settings.frozen_contact_input is None
-            else None
+        mirror_checkpoint_progress = (
+            checkpoint_path is not None
+            and preparation.settings.checkpoint_interval_m is not None
+            and preparation.settings.checkpoint_interval_m > 0.0
+            and preparation.settings.frozen_contact_input is None
         )
+        mirror_preload_progress = (
+            stage == "Preload"
+            and preload_cache_path is not None
+            and preparation.settings.frozen_contact_input is None
+        )
+        progress_mirror: Callable[[FullCaseProgressEvent], None] | None = None
+        if mirror_checkpoint_progress or mirror_preload_progress:
+
+            def progress_mirror(event: FullCaseProgressEvent) -> None:
+                if mirror_checkpoint_progress:
+                    _append_progress_event_history(checkpoint_progress_events, event)
+                if mirror_preload_progress:
+                    _append_progress_event_history(preload_progress_events, event)
+
         progress_callback = _progress_callback(
             preparation,
             stage,
@@ -810,6 +853,7 @@ def run_default_full_case_driver(
             stage=stage,
             original_stage_start_front_mileage=original_stage_start_front_mileage,
             initial_front_mileage=current_front_mileage,
+            progress_events=lambda: tuple(checkpoint_progress_events),
         )
 
         def accepted_callback(accepted: Any) -> None:
@@ -836,6 +880,7 @@ def run_default_full_case_driver(
             history_retention_steps=preparation.settings.history_retention_steps,
             time0=stage_time0,
             step_index0=stage_step_index0,
+            step_dt_callback=step_dt_callback,
         )
         iteration_records, output_rows = build_stage_storage(history)
         contact_state = extract_contact_state(history)
@@ -911,6 +956,7 @@ def _run_checkpoint_callback(
     stage: SimulationStage,
     original_stage_start_front_mileage: float,
     initial_front_mileage: float,
+    progress_events: Callable[[], tuple[FullCaseProgressEvent, ...]] | None = None,
 ) -> Callable[[Any], bool] | None:
     interval = preparation.settings.checkpoint_interval_m
     if checkpoint_path is None or interval is None or interval <= 0.0:
@@ -930,6 +976,7 @@ def _run_checkpoint_callback(
             stage=stage,
             original_stage_start_front_mileage=original_stage_start_front_mileage,
             accepted=accepted,
+            progress_events=() if progress_events is None else progress_events(),
         )
         return True
 
@@ -944,17 +991,84 @@ def _stage_step_count(preparation: FullDefaultCasePreparation, stage: Simulation
     end_mileage = _stage_end_mileage(preparation, stage)
     if end_mileage is None:
         return preparation.settings.n_steps_per_stage
-    step_distance = preparation.operating_case.vlc * preparation.settings.dt
-    if step_distance == 0.0:
+    speed = preparation.operating_case.vlc
+    if speed == 0.0 or preparation.settings.dt == 0.0:
         raise ValueError("vehicle speed and dt must produce nonzero mileage increment")
-    steps_float = (float(end_mileage) - float(start_mileage)) / step_distance
-    if steps_float < -1.0e-12:
-        if steps_float > -1.0:
-            return 0
+    current = float(start_mileage)
+    target = float(end_mileage)
+    if (speed > 0.0 and current >= target - 1.0e-12) or (speed < 0.0 and current <= target + 1.0e-12):
+        return 0
+    if (speed > 0.0 and target < current - 1.0e-12) or (speed < 0.0 and target > current + 1.0e-12):
         raise ValueError(
             f"{stage} end mileage {end_mileage} is behind start mileage {start_mileage} for current direction"
         )
-    return max(0, int(np.ceil(max(0.0, steps_float) - 1.0e-12)))
+
+    count = 0
+    max_count = int(abs((target - current) / (speed * preparation.settings.dt))) * 16 + 1024
+    while (speed > 0.0 and current < target - 1.0e-12) or (speed < 0.0 and current > target + 1.0e-12):
+        step_dt = _matlab_mileage_step_dt(preparation, current, preparation.settings.dt)
+        next_mileage = current + speed * step_dt
+        if (speed > 0.0 and next_mileage > target) or (speed < 0.0 and next_mileage < target):
+            next_mileage = target
+        if abs(next_mileage - current) <= 1.0e-15:
+            raise RuntimeError("stage step-count estimation stopped making mileage progress")
+        current = next_mileage
+        count += 1
+        if count > max_count:
+            raise RuntimeError("stage step-count estimation exceeded its safety limit")
+    return count
+
+
+def _stage_step_dt_callback(
+    preparation: FullDefaultCasePreparation,
+    stage: SimulationStage,
+    *,
+    original_stage_start_front_mileage: float,
+) -> StepDtCallback:
+    end_mileage = _stage_end_mileage(preparation, stage)
+
+    def callback(_step_index: int, time_current: float, nominal_dt: float) -> float:
+        current_mileage = float(original_stage_start_front_mileage) + preparation.operating_case.vlc * float(time_current)
+        step_dt = _matlab_mileage_step_dt(preparation, current_mileage, nominal_dt)
+        if end_mileage is None:
+            return step_dt
+        speed = preparation.operating_case.vlc
+        next_mileage = current_mileage + speed * step_dt
+        if speed > 0.0 and next_mileage > float(end_mileage):
+            return max((float(end_mileage) - current_mileage) / speed, np.finfo(float).eps)
+        if speed < 0.0 and next_mileage < float(end_mileage):
+            return max((float(end_mileage) - current_mileage) / speed, np.finfo(float).eps)
+        return step_dt
+
+    return callback
+
+
+def _matlab_mileage_step_dt(
+    preparation: FullDefaultCasePreparation,
+    front_mileage: float,
+    nominal_dt: float,
+) -> float:
+    """Apply MATLAB's `Pos_WS` small-step windows around the crossing region."""
+
+    if preparation.operating_case.choose_turnout != "07(009)":
+        return float(nominal_dt)
+    vehicle = preparation.vehicle_parameters.values
+    distances = np.array(
+        [
+            0.0,
+            2.0 * float(vehicle["Ll1"]),
+            2.0 * float(vehicle["Ll2"]),
+            2.0 * (float(vehicle["Ll1"]) + float(vehicle["Ll2"])),
+        ],
+        dtype=float,
+    )
+    wheel_positions = float(front_mileage) - distances
+    dt = float(nominal_dt)
+    if np.any((wheel_positions >= 60.0) & (wheel_positions < 104.0)):
+        dt = min(dt, float(nominal_dt) / 2.0)
+    if np.any((wheel_positions >= 104.0) & (wheel_positions < 105.0)):
+        dt = min(dt, float(nominal_dt) / 4.0)
+    return dt
 
 
 def _stage_end_mileage(preparation: FullDefaultCasePreparation, stage: SimulationStage) -> float | None:
@@ -1017,7 +1131,7 @@ def _progress_callback(
             step_index=int(getattr(accepted, "step_index", 0) or 0),
             n_steps=stage_steps,
             time=float(accepted.time),
-            dt=float(preparation.settings.dt),
+            dt=float(getattr(accepted, "dt", preparation.settings.dt)),
             front_mileage=float(rail.front_mileage),
             iterations=int(accepted.iterations),
             normal_error=float("nan"),
@@ -1031,6 +1145,7 @@ def _progress_callback(
             profile_snapshot=profile_snapshot,
             timing=dict(getattr(accepted, "timing", {}) or {}),
             step_wall_time=float(getattr(accepted, "step_wall_time", 0.0) or 0.0),
+            retry_count=int(getattr(accepted, "retry_count", 0) or 0),
             damping_clip_count=len(damping_clip_diagnostics),
             damping_clip_max_delta=damping_clip_max_delta,
             damping_clip_diagnostics=damping_clip_diagnostics,
@@ -1295,9 +1410,7 @@ def _diagnostic_callbacks(
                 state.velocity,
                 front_mileage=rail.front_mileage,
                 track_parameters=preparation.track_contact_parameters,
-                fixed_d0_by_wheelset=(
-                    step_input_state.d0_by_wheelset or None if reuse_contact_state_within_step else None
-                ),
+                fixed_d0_by_wheelset=step_input_state.d0_by_wheelset or None,
                 previous_relvel_max_by_wheelset=previous_relvel_max_by_wheelset,
                 use_cal_d0_trace=preparation.total_dof > 1000,
             )

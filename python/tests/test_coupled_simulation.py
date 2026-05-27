@@ -88,6 +88,38 @@ def test_coupled_time_iteration_shrinks_dt_and_retries_unconverged_step() -> Non
     assert np.isclose(result.dt[-1], 0.005)
     assert np.isclose(result.time[-1], 0.005)
     assert result.iterations[-1] == 1
+    assert result.retry_count.tolist() == [0, 1]
+
+
+def test_coupled_time_iteration_uses_scheduled_dt_for_each_new_step() -> None:
+    system = LinearSecondOrderSystem(
+        mass=np.array([[1.0]]),
+        damping=np.array([[0.0]]),
+        stiffness=np.array([[0.0]]),
+    )
+    attempted: list[tuple[int, float, float]] = []
+
+    def recover(state: CoupledStepState) -> dict[str, float]:
+        attempted.append((state.step_index, state.time, state.dt))
+        return {"dt": state.dt}
+
+    def geometry(state: CoupledStepState, rail: dict[str, float]) -> dict[str, float]:
+        return rail
+
+    def force(state: CoupledStepState, rail: dict[str, float], geom: dict[str, float]) -> np.ndarray:
+        return state.force_guess.copy()
+
+    result = run_coupled_time_iteration(
+        system,
+        CoupledStepCallbacks(recover, geometry, force),
+        dt=0.01,
+        n_steps=3,
+        step_dt_callback=lambda step_index, _time_current, nominal_dt: nominal_dt / step_index,
+    )
+
+    assert [item[2] for item in attempted] == [0.01, 0.005, 0.01 / 3.0]
+    assert np.allclose(result.dt, [0.0, 0.01, 0.005, 0.01 / 3.0])
+    assert np.allclose(result.time, [0.0, 0.01, 0.015, 0.015 + 0.01 / 3.0])
 
 
 def test_coupled_time_iteration_uses_external_force_with_converged_contact() -> None:

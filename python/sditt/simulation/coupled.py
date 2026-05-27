@@ -19,6 +19,7 @@ StateCallback = Callable[["CoupledStepState"], Any]
 ContactForceCallback = Callable[["CoupledStepState", Any, Any], np.ndarray]
 ExternalForceCallback = Callable[[float], np.ndarray]
 ConvergenceCallback = Callable[["CoupledStepState", Any, Any, np.ndarray, np.ndarray, "CoupledIterationSettings"], bool]
+StepDtCallback = Callable[[int, float, float], float]
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class CoupledTimeIterationResult:
     total_force: np.ndarray
     iterations: np.ndarray
     dt: np.ndarray
+    retry_count: np.ndarray
     rail_response: tuple[Any, ...]
     contact_geometry: tuple[Any, ...]
     timing: Mapping[str, float] = field(default_factory=dict)
@@ -107,6 +109,7 @@ def run_coupled_time_iteration(
     history_retention_steps: int | None = None,
     time0: float = 0.0,
     step_index0: int = 0,
+    step_dt_callback: StepDtCallback | None = None,
 ) -> CoupledTimeIterationResult:
     """Run the coupled main loop with force convergence and step-size retry.
 
@@ -169,6 +172,7 @@ def run_coupled_time_iteration(
     total_force_history = [f_ext0 + f_contact]
     iteration_history = [0]
     dt_history = [0.0]
+    retry_count_history = [0]
     rail_history: list[Any] = [None]
     geometry_history: list[Any] = [None]
     integration_q_history = [row.copy() for row in q_seed] if q_seed is not None else [q0]
@@ -179,7 +183,17 @@ def run_coupled_time_iteration(
     stepper_cache: dict[float, PreparedLinearStepper] = {}
     timing: dict[str, float] = {}
     accepted_steps = 0
+    retry_count = 0
+    accepted_step_wall_start = time.perf_counter()
     while accepted_steps < n_steps:
+        if retry_count == 0:
+            current_dt = _scheduled_dt(
+                step_dt_callback,
+                int(step_index0) + accepted_steps + 1,
+                time_history[-1],
+                dt,
+            )
+            accepted_step_wall_start = time.perf_counter()
         stepper = stepper_cache.get(current_dt)
         if stepper is None:
             start = time.perf_counter()
@@ -202,6 +216,7 @@ def run_coupled_time_iteration(
                 timing=timing,
             )
         except _StepDidNotConverge:
+            retry_count += 1
             current_dt *= settings.shrink_factor
             if current_dt < settings.min_dt:
                 raise RuntimeError(
@@ -209,6 +224,11 @@ def run_coupled_time_iteration(
                 ) from None
             continue
 
+        accepted = replace(
+            accepted,
+            retry_count=retry_count,
+            step_wall_time=time.perf_counter() - accepted_step_wall_start,
+        )
         time_history.append(accepted.time)
         q_history.append(accepted.displacement)
         v_history.append(accepted.velocity)
@@ -217,6 +237,7 @@ def run_coupled_time_iteration(
         total_force_history.append(accepted.total_force)
         iteration_history.append(accepted.iterations)
         dt_history.append(current_dt)
+        retry_count_history.append(retry_count)
         rail_history.append(accepted.rail_response)
         geometry_history.append(accepted.contact_geometry)
         integration_q_history.append(accepted.displacement)
@@ -250,10 +271,12 @@ def run_coupled_time_iteration(
                 del total_force_history[:drop]
                 del iteration_history[:drop]
                 del dt_history[:drop]
+                del retry_count_history[:drop]
                 del rail_history[:drop]
                 del geometry_history[:drop]
         if settings.reset_dt_after_success:
             current_dt = float(dt)
+        retry_count = 0
 
     return CoupledTimeIterationResult(
         step_index=np.asarray(step_index_history, dtype=int),
@@ -265,6 +288,7 @@ def run_coupled_time_iteration(
         total_force=np.vstack(total_force_history),
         iterations=np.asarray(iteration_history, dtype=int),
         dt=np.asarray(dt_history, dtype=float),
+        retry_count=np.asarray(retry_count_history, dtype=int),
         rail_response=tuple(rail_history),
         contact_geometry=tuple(geometry_history),
         timing=dict(timing),
@@ -275,6 +299,7 @@ def run_coupled_time_iteration(
 class _AcceptedStep:
     step_index: int
     time: float
+    dt: float
     displacement: np.ndarray
     velocity: np.ndarray
     acceleration: np.ndarray
@@ -285,6 +310,7 @@ class _AcceptedStep:
     contact_geometry: Any
     timing: Mapping[str, float] = field(default_factory=dict)
     step_wall_time: float = 0.0
+    retry_count: int = 0
     displacement_history_seed: np.ndarray | None = None
     velocity_history_seed: np.ndarray | None = None
     acceleration_history_seed: np.ndarray | None = None
@@ -361,6 +387,7 @@ def _attempt_coupled_step(
             return _AcceptedStep(
                 step_index=step_index,
                 time=time_next,
+                dt=dt,
                 displacement=q_next,
                 velocity=v_next,
                 acceleration=a_next,
@@ -381,6 +408,15 @@ def _add_timing(timing: dict[str, float] | None, name: str, start: float) -> Non
     if timing is None:
         return
     timing[name] = timing.get(name, 0.0) + (time.perf_counter() - start)
+
+
+def _scheduled_dt(callback: StepDtCallback | None, step_index: int, time_current: float, nominal_dt: float) -> float:
+    if callback is None:
+        return float(nominal_dt)
+    scheduled = float(callback(step_index, float(time_current), float(nominal_dt)))
+    if scheduled <= 0.0:
+        raise ValueError("step_dt_callback must return a positive dt")
+    return scheduled
 
 
 def _integrate_candidate(
