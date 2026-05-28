@@ -18,7 +18,8 @@ from sditt.simulation import (
     FullCaseSideProfileSnapshot,
     FullDefaultCaseRunResult,
     FullDefaultCaseSettings,
-    find_default_full_case_checkpoint,
+    list_default_full_case_checkpoints,
+    load_default_full_case_checkpoint_summary,
     run_default_full_case_driver,
 )
 
@@ -44,6 +45,8 @@ _PATCH_FORCE_COLORS = (
     "#72b7b2",
     "#b279a2",
 )
+_PLOT_FONT_FAMILY = "Times New Roman"
+_LIVE_REFRESH_MS = 1000
 
 
 @dataclass(frozen=True)
@@ -69,7 +72,9 @@ def build_python_short_run_snapshot(
     preload_cache_dir: str | Path | None = None,
     history_retention_steps: int | None = 256,
     checkpoint_dir: str | Path | None = None,
+    save_checkpoints: bool = False,
     resume_checkpoint: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
@@ -83,7 +88,9 @@ def build_python_short_run_snapshot(
         preload_cache_dir=preload_cache_dir,
         history_retention_steps=history_retention_steps,
         checkpoint_dir=checkpoint_dir,
+        save_checkpoints=save_checkpoints,
         resume_checkpoint=resume_checkpoint,
+        resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_callback,
     )
     result = run_default_full_case_driver(settings=settings)
@@ -105,7 +112,11 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "checkpoint_dir": None
             if preparation.settings.checkpoint_dir is None
             else str(preparation.settings.checkpoint_dir),
+            "save_checkpoints": preparation.settings.save_checkpoints,
             "resume_checkpoint": preparation.settings.resume_checkpoint,
+            "resume_checkpoint_path": None
+            if preparation.settings.resume_checkpoint_path is None
+            else str(preparation.settings.resume_checkpoint_path),
             "preload_cache_dir": None
             if preparation.settings.preload_cache_dir is None
             else str(preparation.settings.preload_cache_dir),
@@ -145,7 +156,9 @@ def write_full_case_short_run_report(
     preload_cache_dir: str | Path | None = None,
     history_retention_steps: int | None = 256,
     checkpoint_dir: str | Path | None = None,
+    save_checkpoints: bool = False,
     resume_checkpoint: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
     progress_recorder: "_ProgressRecorder | None" = None,
     matlab_baseline_path: str | Path | None = None,
     abs_tolerance: float = DEFAULT_ABS_TOLERANCE,
@@ -167,7 +180,9 @@ def write_full_case_short_run_report(
         preload_cache_dir=preload_cache_dir,
         history_retention_steps=history_retention_steps,
         checkpoint_dir=checkpoint_dir,
+        save_checkpoints=save_checkpoints,
         resume_checkpoint=resume_checkpoint,
+        resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_writer,
     )
     snapshot_path = output_path / "python_snapshot.json"
@@ -818,8 +833,9 @@ class _ProgressRecorder:
         if not events:
             return (
                 f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-                f'viewBox="0 0 {width} {height}"><rect width="100%" height="100%" fill="#ffffff"/>'
-                '<text x="24" y="28" font-family="Arial" font-size="18" fill="#202020">'
+                f'viewBox="0 0 {width} {height}" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">'
+                '<rect width="100%" height="100%" fill="#ffffff"/>'
+                f'<text x="24" y="28" font-family="{_PLOT_FONT_FAMILY}" font-size="18" fill="#202020">'
                 "SDITT full-case progress</text></svg>"
             )
         xs = np.asarray([event.front_mileage for event in events], dtype=float)
@@ -827,9 +843,10 @@ class _ProgressRecorder:
         patch_forces = _patch_force_matrix(events, patch_labels, patch_indices)
         stages = [event.stage for event in events]
         parts = [
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+            f'viewBox="0 0 {width} {height}" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">',
             '<rect width="100%" height="100%" fill="#ffffff"/>',
-            '<text x="24" y="28" font-family="Arial" font-size="18" fill="#202020">SDITT full-case progress</text>',
+            f'<text x="24" y="28" font-family="{_PLOT_FONT_FAMILY}" font-size="18" fill="#202020">SDITT full-case progress</text>',
         ]
         parts.extend(
             self._plot_multi(
@@ -840,14 +857,15 @@ class _ProgressRecorder:
                 x=margin_left,
                 y=plot_top,
                 width=plot_width,
-                height=plot_height,
-                title="Patch wheel-rail force magnitude",
-                y_label="Patch force magnitude (kN)",
-            )
+            height=plot_height,
+            title="Patch wheel-rail force magnitude",
+            y_label="Patch force magnitude (kN)",
+            y_tick_digits=1,
+        )
         )
         last = events[-1]
         parts.append(
-            f'<text x="24" y="{height - 24}" font-family="Arial" font-size="13" fill="#404040">'
+            f'<text x="24" y="{height - 24}" font-family="{_PLOT_FONT_FAMILY}" font-size="13" fill="#404040">'
             f"latest: {last.stage} step {last.step_index}/{last.n_steps}, mileage {last.front_mileage:.6f} m, "
             f"iterations {last.iterations}, retries {last.retry_count}</text>"
         )
@@ -867,9 +885,10 @@ class _ProgressRecorder:
         height: int,
         title: str,
         y_label: str,
+        y_tick_digits: int,
     ) -> list[str]:
         x0, x1 = _plot_range(xs)
-        y0, y1 = _plot_range(ys)
+        y0, y1 = _plot_range(ys, min_value=0.0)
         x_ticks = _plot_ticks(x0, x1)
         y_ticks = _plot_ticks(y0, y1)
         stage_lines = []
@@ -885,17 +904,17 @@ class _ProgressRecorder:
             seen_stage_changes.add(key)
             px = x + (float(xs[index]) - x0) / (x1 - x0) * width
             stage_lines.append(f'<line x1="{px:.3f}" y1="{y}" x2="{px:.3f}" y2="{y + height}" stroke="#8a8a8a" stroke-dasharray="4 4"/>')
-            stage_lines.append(f'<text x="{px + 6:.3f}" y="{y + 16}" font-family="Arial" font-size="12" fill="#555">{stage}</text>')
+            stage_lines.append(f'<text x="{px + 6:.3f}" y="{y + 16}" font-family="{_PLOT_FONT_FAMILY}" font-size="12" fill="#555">{stage}</text>')
             previous_stage = stage
         tick_lines: list[str] = []
         for tick in x_ticks:
             px = x + (tick - x0) / (x1 - x0) * width
-            tick_lines.append(f'<line x1="{px:.3f}" y1="{y + height}" x2="{px:.3f}" y2="{y + height + 5}" stroke="#444"/>')
-            tick_lines.append(f'<text x="{px:.3f}" y="{y + height + 20}" font-family="Arial" font-size="11" fill="#444" text-anchor="middle">{tick:.3g}</text>')
+            tick_lines.append(f'<line x1="{px:.3f}" y1="{y + height}" x2="{px:.3f}" y2="{y + height - 6}" stroke="#444"/>')
+            tick_lines.append(f'<text x="{px:.3f}" y="{y + height + 20}" font-family="{_PLOT_FONT_FAMILY}" font-size="11" fill="#444" text-anchor="middle">{tick:.3g}</text>')
         for tick in y_ticks:
             py = y + height - (tick - y0) / (y1 - y0) * height
-            tick_lines.append(f'<line x1="{x - 5}" y1="{py:.3f}" x2="{x}" y2="{py:.3f}" stroke="#444"/>')
-            tick_lines.append(f'<text x="{x - 8}" y="{py + 4:.3f}" font-family="Arial" font-size="11" fill="#444" text-anchor="end">{tick:.3g}</text>')
+            tick_lines.append(f'<line x1="{x}" y1="{py:.3f}" x2="{x + 6}" y2="{py:.3f}" stroke="#444"/>')
+            tick_lines.append(f'<text x="{x - 8}" y="{py + 4:.3f}" font-family="{_PLOT_FONT_FAMILY}" font-size="11" fill="#444" text-anchor="end">{tick:.{y_tick_digits}f}</text>')
         series_parts: list[str] = []
         for series_index, label in enumerate(labels):
             color = _PATCH_FORCE_COLORS[series_index % len(_PATCH_FORCE_COLORS)]
@@ -905,21 +924,21 @@ class _ProgressRecorder:
                     series_parts.append(f'<circle cx="{px:.3f}" cy="{py:.3f}" r="3" fill="{color}"/>')
                 else:
                     points = " ".join(f"{px:.3f},{py:.3f}" for px, py in segment)
-                    series_parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="1.7"/>')
-            legend_y = y + 8 + series_index * 18
-            legend_x = x + width + 18
+                    series_parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/>')
+            legend_y = y + 12 + series_index * 18
+            legend_x = x + width - 92
             series_parts.append(f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 18}" y2="{legend_y}" stroke="{color}" stroke-width="2"/>')
-            series_parts.append(f'<text x="{legend_x + 24}" y="{legend_y + 4}" font-family="Arial" font-size="11" fill="#333">{label}</text>')
+            series_parts.append(f'<text x="{legend_x + 24}" y="{legend_y + 4}" font-family="{_PLOT_FONT_FAMILY}" font-size="11" fill="#333">{label}</text>')
         return [
-            f'<text x="{x}" y="{y - 14}" font-family="Arial" font-size="15" fill="#202020">{title}</text>',
+            f'<text x="{x}" y="{y - 14}" font-family="{_PLOT_FONT_FAMILY}" font-size="15" fill="#202020">{title}</text>',
             f'<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="#f8f8f8" stroke="#c8c8c8"/>',
             f'<line x1="{x}" y1="{y + height}" x2="{x + width}" y2="{y + height}" stroke="#444"/>',
             f'<line x1="{x}" y1="{y}" x2="{x}" y2="{y + height}" stroke="#444"/>',
             *tick_lines,
             *series_parts,
             *stage_lines,
-            f'<text x="{x + width / 2:.3f}" y="{y + height + 42}" font-family="Arial" font-size="12" fill="#202020" text-anchor="middle">Mileage (m)</text>',
-            f'<text x="{x - 50}" y="{y + height / 2:.3f}" font-family="Arial" font-size="12" fill="#202020" text-anchor="middle" transform="rotate(-90 {x - 50} {y + height / 2:.3f})">{y_label}</text>',
+            f'<text x="{x + width / 2:.3f}" y="{y + height + 42}" font-family="{_PLOT_FONT_FAMILY}" font-size="12" fill="#202020" text-anchor="middle">Mileage (m)</text>',
+            f'<text x="{x - 50}" y="{y + height / 2:.3f}" font-family="{_PLOT_FONT_FAMILY}" font-size="12" fill="#202020" text-anchor="middle" transform="rotate(-90 {x - 50} {y + height / 2:.3f})">{y_label}</text>',
         ]
 
     def _plot(
@@ -934,9 +953,10 @@ class _ProgressRecorder:
         height: int,
         title: str,
         y_label: str,
+        y_tick_digits: int,
     ) -> list[str]:
         x0, x1 = _plot_range(xs)
-        y0, y1 = _plot_range(ys)
+        y0, y1 = _plot_range(ys, min_value=0.0)
         x_ticks = _plot_ticks(x0, x1)
         y_ticks = _plot_ticks(y0, y1)
         points = []
@@ -957,28 +977,50 @@ class _ProgressRecorder:
             seen_stage_changes.add(key)
             px = x + (float(xs[index]) - x0) / (x1 - x0) * width
             stage_lines.append(f'<line x1="{px:.3f}" y1="{y}" x2="{px:.3f}" y2="{y + height}" stroke="#8a8a8a" stroke-dasharray="4 4"/>')
-            stage_lines.append(f'<text x="{px + 6:.3f}" y="{y + 16}" font-family="Arial" font-size="12" fill="#555">{stage}</text>')
+            stage_lines.append(f'<text x="{px + 6:.3f}" y="{y + 16}" font-family="{_PLOT_FONT_FAMILY}" font-size="12" fill="#555">{stage}</text>')
             previous_stage = stage
         tick_lines: list[str] = []
         for tick in x_ticks:
             px = x + (tick - x0) / (x1 - x0) * width
-            tick_lines.append(f'<line x1="{px:.3f}" y1="{y + height}" x2="{px:.3f}" y2="{y + height + 5}" stroke="#444"/>')
-            tick_lines.append(f'<text x="{px:.3f}" y="{y + height + 20}" font-family="Arial" font-size="11" fill="#444" text-anchor="middle">{tick:.3g}</text>')
+            tick_lines.append(f'<line x1="{px:.3f}" y1="{y + height}" x2="{px:.3f}" y2="{y + height - 6}" stroke="#444"/>')
+            tick_lines.append(f'<text x="{px:.3f}" y="{y + height + 20}" font-family="{_PLOT_FONT_FAMILY}" font-size="11" fill="#444" text-anchor="middle">{tick:.3g}</text>')
         for tick in y_ticks:
             py = y + height - (tick - y0) / (y1 - y0) * height
-            tick_lines.append(f'<line x1="{x - 5}" y1="{py:.3f}" x2="{x}" y2="{py:.3f}" stroke="#444"/>')
-            tick_lines.append(f'<text x="{x - 8}" y="{py + 4:.3f}" font-family="Arial" font-size="11" fill="#444" text-anchor="end">{tick:.3g}</text>')
+            tick_lines.append(f'<line x1="{x}" y1="{py:.3f}" x2="{x + 6}" y2="{py:.3f}" stroke="#444"/>')
+            tick_lines.append(f'<text x="{x - 8}" y="{py + 4:.3f}" font-family="{_PLOT_FONT_FAMILY}" font-size="11" fill="#444" text-anchor="end">{tick:.{y_tick_digits}f}</text>')
         return [
-            f'<text x="{x}" y="{y - 14}" font-family="Arial" font-size="15" fill="#202020">{title}</text>',
+            f'<text x="{x}" y="{y - 14}" font-family="{_PLOT_FONT_FAMILY}" font-size="15" fill="#202020">{title}</text>',
             f'<rect x="{x}" y="{y}" width="{width}" height="{height}" fill="#f8f8f8" stroke="#c8c8c8"/>',
             f'<line x1="{x}" y1="{y + height}" x2="{x + width}" y2="{y + height}" stroke="#444"/>',
             f'<line x1="{x}" y1="{y}" x2="{x}" y2="{y + height}" stroke="#444"/>',
             *tick_lines,
-            f'<polyline points="{" ".join(points)}" fill="none" stroke="#1f77b4" stroke-width="2"/>',
+            f'<polyline points="{" ".join(points)}" fill="none" stroke="#1f77b4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>',
             *stage_lines,
-            f'<text x="{x + width / 2:.3f}" y="{y + height + 42}" font-family="Arial" font-size="12" fill="#202020" text-anchor="middle">Mileage (m)</text>',
-            f'<text x="{x - 50}" y="{y + height / 2:.3f}" font-family="Arial" font-size="12" fill="#202020" text-anchor="middle" transform="rotate(-90 {x - 50} {y + height / 2:.3f})">{y_label}</text>',
+            f'<text x="{x + width / 2:.3f}" y="{y + height + 42}" font-family="{_PLOT_FONT_FAMILY}" font-size="12" fill="#202020" text-anchor="middle">Mileage (m)</text>',
+            f'<text x="{x - 50}" y="{y + height / 2:.3f}" font-family="{_PLOT_FONT_FAMILY}" font-size="12" fill="#202020" text-anchor="middle" transform="rotate(-90 {x - 50} {y + height / 2:.3f})">{y_label}</text>',
         ]
+
+
+class _PausableProgressRecorder:
+    def __init__(
+        self,
+        recorder: _ProgressRecorder,
+        *,
+        pause_event: threading.Event,
+        state: dict[str, Any],
+    ) -> None:
+        self.recorder = recorder
+        self.pause_event = pause_event
+        self.state = state
+
+    def __call__(self, event: FullCaseProgressEvent) -> None:
+        self.recorder(event)
+        while not self.pause_event.wait(0.2):
+            if self.state.get("done") or self.state.get("error"):
+                return
+
+    def write_outputs(self, output_dir: Path) -> tuple[Path, Path]:
+        return self.recorder.write_outputs(output_dir)
 
 
 def _patch_force_labels(events: Iterable[FullCaseProgressEvent]) -> tuple[str, ...]:
@@ -1080,16 +1122,24 @@ def _plot_series_segments(
     return segments
 
 
-def _plot_range(values: np.ndarray) -> tuple[float, float]:
+def _plot_range(values: np.ndarray, *, min_value: float | None = None) -> tuple[float, float]:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
-        return 0.0, 1.0
+        low = 0.0 if min_value is None else float(min_value)
+        return low, low + 1.0
     low = float(np.min(finite))
     high = float(np.max(finite))
+    if min_value is not None:
+        low = float(min_value)
+        high = max(high, low)
     if low == high:
         pad = max(abs(low) * 0.05, 1.0)
+        if min_value is not None:
+            return float(min_value), max(float(min_value) + pad, high + pad)
         return low - pad, high + pad
     pad = (high - low) * 0.05
+    if min_value is not None:
+        return float(min_value), high + pad
     return low - pad, high + pad
 
 
@@ -1144,9 +1194,11 @@ _LIVE_DISPLAY_MAX_POINTS = 2000
 class _LiveProgressWindow:
     def __init__(self, recorder: _ProgressRecorder, state: dict[str, Any], *, start_callback: Any) -> None:
         import tkinter as tk
+        from tkinter import filedialog
         from tkinter import ttk
 
         self.tk = tk
+        self.filedialog = filedialog
         self.recorder = recorder
         self.state = state
         self.start_callback = start_callback
@@ -1159,16 +1211,37 @@ class _LiveProgressWindow:
 
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=12, pady=(10, 4))
+        self.save_checkpoints_var = tk.BooleanVar(value=bool(state.get("save_checkpoints")))
+        self.save_check = ttk.Checkbutton(
+            controls,
+            text="本次运行生成存档",
+            variable=self.save_checkpoints_var,
+        )
+        self.save_check.pack(side="left", padx=(0, 12))
         self.resume_var = tk.BooleanVar(value=bool(state.get("resume_checkpoint")))
         self.resume_check = ttk.Checkbutton(
             controls,
-            text=self._resume_option_text(),
+            text="采用之前的存档",
             variable=self.resume_var,
-            state="normal" if state.get("checkpoint_summary") else "disabled",
+            state="normal" if state.get("checkpoint_summaries") else "disabled",
         )
         self.resume_check.pack(side="left")
-        self.start_button = ttk.Button(controls, text="开始运行", command=self._start_run)
+        self.choose_button = ttk.Button(controls, text="选择存档文件", command=self._choose_checkpoint_file)
+        self.choose_button.pack(side="left", padx=(12, 0))
+        self.start_button = ttk.Button(controls, text="开始计算", command=self._start_run)
         self.start_button.pack(side="right")
+        self.pause_button = ttk.Button(controls, text="暂停计算", command=self._toggle_pause, state="disabled")
+        self.pause_button.pack(side="right", padx=(0, 8))
+        chooser = ttk.Frame(self.root)
+        chooser.pack(fill="x", padx=12, pady=(0, 4))
+        self.checkpoint_choice_var = tk.StringVar(value=self._selected_checkpoint_label())
+        self.checkpoint_combo = ttk.Combobox(
+            chooser,
+            textvariable=self.checkpoint_choice_var,
+            values=self._checkpoint_choice_labels(),
+            state="readonly" if state.get("checkpoint_summaries") else "disabled",
+        )
+        self.checkpoint_combo.pack(fill="x")
         self.summary = ttk.Label(self.root, text="Starting...", anchor="w")
         self.summary.pack(fill="x", padx=12, pady=(0, 4))
         self.progress = ttk.Progressbar(self.root, orient="horizontal", mode="determinate", maximum=100.0)
@@ -1178,44 +1251,117 @@ class _LiveProgressWindow:
         self.status = ttk.Label(self.root, text="Close hides the window; the simulation keeps running.", anchor="w")
         self.status.pack(fill="x", padx=12, pady=(0, 10))
         self._latest_events: tuple[FullCaseProgressEvent, ...] = ()
+        self._refresh_after_id: str | None = None
         self._resize_after_id: str | None = None
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
 
-    def _resume_option_text(self) -> str:
-        summary = self.state.get("checkpoint_summary")
-        if not summary:
+    def _checkpoint_choice_labels(self) -> tuple[str, ...]:
+        return tuple(self._checkpoint_label(summary) for summary in self.state.get("checkpoint_summaries", ()))
+
+    def _selected_checkpoint_label(self) -> str:
+        summaries = tuple(self.state.get("checkpoint_summaries", ()))
+        if not summaries:
             return "无可用历史存档"
+        selected = self.state.get("checkpoint_summary") or summaries[0]
+        return self._checkpoint_label(selected)
+
+    def _checkpoint_label(self, summary: dict[str, Any]) -> str:
+        path = Path(summary.get("path", ""))
         return (
-            "从历史存档恢复 "
-            f"({summary.get('stage')} {float(summary.get('front_mileage', 0.0)):.3f} m)"
+            f"{summary.get('stage')} | {float(summary.get('front_mileage', 0.0)):.3f} m | "
+            f"step {int(summary.get('step_index') or 0)} | {path.name}"
         )
+
+    def _selected_checkpoint_summary(self) -> dict[str, Any] | None:
+        label = self.checkpoint_choice_var.get()
+        for summary in self.state.get("checkpoint_summaries", ()):
+            if self._checkpoint_label(summary) == label:
+                return summary
+        return None
+
+    def _choose_checkpoint_file(self) -> None:
+        path = self.filedialog.askopenfilename(
+            title="选择 SDITT 存档文件",
+            filetypes=(("Checkpoint files", "*.pkl"), ("All files", "*")),
+        )
+        if not path:
+            return
+        validator = self.state.get("validate_checkpoint_path")
+        summary = None if validator is None else validator(Path(path))
+        if summary is None:
+            self.status.configure(text="选择的存档与当前运行参数或数据文件不兼容。")
+            return
+        summaries = [summary]
+        summaries.extend(
+            existing
+            for existing in self.state.get("checkpoint_summaries", ())
+            if Path(existing.get("path", "")) != Path(summary.get("path", ""))
+        )
+        self.state["checkpoint_summaries"] = tuple(summaries)
+        self.state["checkpoint_summary"] = summary
+        labels = self._checkpoint_choice_labels()
+        self.checkpoint_combo.configure(values=labels, state="readonly")
+        self.resume_check.configure(state="normal")
+        self.checkpoint_choice_var.set(self._checkpoint_label(summary))
+        self.resume_var.set(True)
 
     def _start_run(self) -> None:
         if self.state.get("worker_started"):
             return
-        self.state["resume_checkpoint"] = bool(self.resume_var.get() and self.state.get("checkpoint_summary"))
+        selected_summary = self._selected_checkpoint_summary()
+        self.state["save_checkpoints"] = bool(self.save_checkpoints_var.get())
+        self.state["resume_checkpoint"] = bool(self.resume_var.get() and selected_summary is not None)
+        self.state["checkpoint_summary"] = selected_summary
+        self.state["resume_checkpoint_path"] = None if selected_summary is None else Path(selected_summary["path"])
         self.state["worker_started"] = True
         self.started_at = time.monotonic()
         self.completed_elapsed = None
         self.start_button.configure(state="disabled")
+        self.save_check.configure(state="disabled")
         self.resume_check.configure(state="disabled")
+        self.choose_button.configure(state="disabled")
+        self.checkpoint_combo.configure(state="disabled")
+        self.pause_button.configure(state="normal")
         self.start_callback()
 
+    def _toggle_pause(self) -> None:
+        pause_event = self.state.get("pause_event")
+        if pause_event is None or not self.state.get("worker_started") or self.state.get("done"):
+            return
+        if self.state.get("paused"):
+            pause_event.set()
+            self.state["paused"] = False
+            self.pause_button.configure(text="暂停计算")
+            self._schedule_refresh(0)
+        else:
+            pause_event.clear()
+            self.state["paused"] = True
+            self.pause_button.configure(text="继续计算")
+            self.status.configure(text="Paused. 点击继续计算恢复。")
+            if self._refresh_after_id is not None:
+                self.root.after_cancel(self._refresh_after_id)
+                self._refresh_after_id = None
+
     def run(self) -> None:
-        self.root.after(250, self._refresh)
+        self._schedule_refresh(_LIVE_REFRESH_MS)
         self.root.mainloop()
+
+    def _schedule_refresh(self, delay_ms: int = _LIVE_REFRESH_MS) -> None:
+        if self._refresh_after_id is None:
+            self._refresh_after_id = self.root.after(delay_ms, self._refresh)
 
     def _hide_window(self) -> None:
         self.closed = True
         self.root.withdraw()
 
     def _refresh(self) -> None:
+        self._refresh_after_id = None
         events = self.recorder.sampled_snapshot(_LIVE_DISPLAY_MAX_POINTS)
         if not self.state.get("worker_started"):
             self.summary.configure(text="Ready to run.")
-            self.status.configure(text="选择是否使用历史存档，然后点击开始运行。")
-            self.root.after(500, self._refresh)
+            self.status.configure(text="选择是否生成存档、是否使用历史存档，然后点击开始计算。")
+            self._schedule_refresh()
             return
         elapsed_seconds = self._elapsed_seconds()
         elapsed_text = _format_elapsed_time(elapsed_seconds)
@@ -1235,22 +1381,28 @@ class _LiveProgressWindow:
             )
             self._draw(events)
         if self.state.get("error") is not None:
+            self.pause_button.configure(state="disabled")
             self.status.configure(text=f"Error: {self.state['error']}")
             if self.closed:
                 self.root.destroy()
                 return
         elif self.state.get("done"):
+            self.pause_button.configure(state="disabled")
             suffix = f" Timing: {timing_text}." if timing_text else ""
             self.status.configure(text=f"Completed in {elapsed_text}.{suffix} Final progress files have been written; close the window to exit.")
             if self.closed:
                 self.root.destroy()
                 return
+        elif self.state.get("paused"):
+            suffix = f" Timing: {timing_text}." if timing_text else ""
+            self.status.configure(text=f"Paused at {elapsed_text}.{suffix} 点击继续计算恢复。")
+            return
         else:
             suffix = f" Timing: {timing_text}." if timing_text else ""
             resume = self.state.get("resumed_text", "")
             prefix = f"{resume} " if resume else ""
             self.status.configure(text=f"{prefix}Running for {elapsed_text}.{suffix} Close hides the window; the simulation keeps running.")
-        self.root.after(500, self._refresh)
+        self._schedule_refresh()
 
     def _elapsed_seconds(self) -> float:
         if self.state.get("done") and self.completed_elapsed is None:
@@ -1273,7 +1425,7 @@ class _LiveProgressWindow:
         profile_x = margin_left + plot_width + profile_column_gap
         plot_top = 45
         compact = height < 560
-        available_height = max(220, height - plot_top - 28)
+        available_height = max(220, height - plot_top - 62)
         if wide_layout:
             chart_gap = 54 if compact else 66
             plot_height = max(115, min(250, int((available_height - chart_gap) * 0.52)))
@@ -1301,7 +1453,8 @@ class _LiveProgressWindow:
             height=plot_height,
             title="Patch wheel-rail force magnitude",
             y_label="Patch force magnitude (kN)",
-            show_legend=not wide_layout and width >= 820,
+            show_legend=True,
+            y_tick_digits=1,
         )
         if wide_layout:
             self._draw_plot(
@@ -1315,6 +1468,7 @@ class _LiveProgressWindow:
                 title="Step wall time",
                 y_label="Seconds/step",
                 latest_marker="※",
+                y_tick_digits=2,
             )
             self._draw_profile_panel(
                 events[-1].profile_snapshot,
@@ -1359,25 +1513,26 @@ class _LiveProgressWindow:
         title: str,
         y_label: str,
         show_legend: bool,
+        y_tick_digits: int,
     ) -> None:
         x0, x1 = _plot_range(xs)
-        y0, y1 = _plot_range(ys)
+        y0, y1 = _plot_range(ys, min_value=0.0)
         x_ticks = _plot_ticks(x0, x1)
         y_ticks = _plot_ticks(y0, y1)
-        self.canvas.create_text(x, y - 18, text=title, anchor="w", font=("Arial", 14), fill="#202020")
+        self.canvas.create_text(x, y - 18, text=title, anchor="w", font=(_PLOT_FONT_FAMILY, 14), fill="#202020")
         self.canvas.create_rectangle(x, y, x + width, y + height, fill="#f8f8f8", outline="#c8c8c8")
         self.canvas.create_line(x, y + height, x + width, y + height, fill="#444444")
         self.canvas.create_line(x, y, x, y + height, fill="#444444")
         for tick in x_ticks:
             px = x + (float(tick) - x0) / (x1 - x0) * width
-            self.canvas.create_line(px, y + height, px, y + height + 5, fill="#444444")
-            self.canvas.create_text(px, y + height + 18, text=f"{tick:.3g}", anchor="n", font=("Arial", 10), fill="#444444")
+            self.canvas.create_line(px, y + height, px, y + height - 6, fill="#444444")
+            self.canvas.create_text(px, y + height + 18, text=f"{tick:.3g}", anchor="n", font=(_PLOT_FONT_FAMILY, 10), fill="#444444")
         for tick in y_ticks:
             py = y + height - (float(tick) - y0) / (y1 - y0) * height
-            self.canvas.create_line(x - 5, py, x, py, fill="#444444")
-            self.canvas.create_text(x - 8, py, text=f"{tick:.3g}", anchor="e", font=("Arial", 10), fill="#444444")
-        self.canvas.create_text(x + width / 2, y + height + 38, text="Mileage (m)", anchor="n", font=("Arial", 11), fill="#202020")
-        self.canvas.create_text(x - 52, y + height / 2, text=y_label, anchor="center", angle=90, font=("Arial", 11), fill="#202020")
+            self.canvas.create_line(x, py, x + 6, py, fill="#444444")
+            self.canvas.create_text(x - 8, py, text=f"{tick:.{y_tick_digits}f}", anchor="e", font=(_PLOT_FONT_FAMILY, 10), fill="#444444")
+        self.canvas.create_text(x + width / 2, y + height + 38, text="Mileage (m)", anchor="n", font=(_PLOT_FONT_FAMILY, 11), fill="#202020")
+        self.canvas.create_text(x - 52, y + height / 2, text=y_label, anchor="center", angle=90, font=(_PLOT_FONT_FAMILY, 11), fill="#202020")
         for series_index, label in enumerate(labels):
             color = _PATCH_FORCE_COLORS[series_index % len(_PATCH_FORCE_COLORS)]
             for segment in _plot_series_segments(xs, ys[:, series_index], x0=x0, x1=x1, y0=y0, y1=y1, x=x, y=y, width=width, height=height):
@@ -1385,18 +1540,18 @@ class _LiveProgressWindow:
                 for px, py in segment:
                     points.extend([px, py])
                 if len(points) >= 4:
-                    self.canvas.create_line(*points, fill=color, width=2)
+                    self.canvas.create_line(*points, fill=color, width=2, smooth=True, splinesteps=24)
                 elif len(points) == 2:
                     self.canvas.create_oval(points[0] - 3, points[1] - 3, points[0] + 3, points[1] + 3, fill=color, outline="")
             if show_legend:
                 row_spacing = 14
-                rows = max(1, int((height - 8) / row_spacing))
+                rows = max(1, int((height - 16) / row_spacing))
                 row = series_index % rows
                 column = series_index // rows
-                legend_y = y + 8 + row * row_spacing
-                legend_x = x + width + 16 + column * 76
+                legend_x = x + width - 88 - column * 76
+                legend_y = y + 12 + row * row_spacing
                 self.canvas.create_line(legend_x, legend_y, legend_x + 14, legend_y, fill=color, width=2)
-                self.canvas.create_text(legend_x + 19, legend_y, text=label, anchor="w", font=("Arial", 9), fill="#333333")
+                self.canvas.create_text(legend_x + 19, legend_y, text=label, anchor="w", font=(_PLOT_FONT_FAMILY, 9), fill="#333333")
         previous_stage = stages[0] if stages else ""
         for index, stage in enumerate(stages):
             if index == 0 or stage == previous_stage:
@@ -1404,7 +1559,7 @@ class _LiveProgressWindow:
                 continue
             px = x + (float(xs[index]) - x0) / (x1 - x0) * width
             self.canvas.create_line(px, y, px, y + height, fill="#8a8a8a", dash=(4, 4))
-            self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=("Arial", 11), fill="#555555")
+            self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=(_PLOT_FONT_FAMILY, 11), fill="#555555")
             previous_stage = stage
 
     def _draw_plot(
@@ -1420,25 +1575,26 @@ class _LiveProgressWindow:
         title: str,
         y_label: str,
         latest_marker: str | None = None,
+        y_tick_digits: int = 2,
     ) -> None:
         x0, x1 = _plot_range(xs)
-        y0, y1 = _plot_range(ys)
+        y0, y1 = _plot_range(ys, min_value=0.0)
         x_ticks = _plot_ticks(x0, x1)
         y_ticks = _plot_ticks(y0, y1)
-        self.canvas.create_text(x, y - 18, text=title, anchor="w", font=("Arial", 14), fill="#202020")
+        self.canvas.create_text(x, y - 18, text=title, anchor="w", font=(_PLOT_FONT_FAMILY, 14), fill="#202020")
         self.canvas.create_rectangle(x, y, x + width, y + height, fill="#f8f8f8", outline="#c8c8c8")
         self.canvas.create_line(x, y + height, x + width, y + height, fill="#444444")
         self.canvas.create_line(x, y, x, y + height, fill="#444444")
         for tick in x_ticks:
             px = x + (float(tick) - x0) / (x1 - x0) * width
-            self.canvas.create_line(px, y + height, px, y + height + 5, fill="#444444")
-            self.canvas.create_text(px, y + height + 18, text=f"{tick:.3g}", anchor="n", font=("Arial", 10), fill="#444444")
+            self.canvas.create_line(px, y + height, px, y + height - 6, fill="#444444")
+            self.canvas.create_text(px, y + height + 18, text=f"{tick:.3g}", anchor="n", font=(_PLOT_FONT_FAMILY, 10), fill="#444444")
         for tick in y_ticks:
             py = y + height - (float(tick) - y0) / (y1 - y0) * height
-            self.canvas.create_line(x - 5, py, x, py, fill="#444444")
-            self.canvas.create_text(x - 8, py, text=f"{tick:.3g}", anchor="e", font=("Arial", 10), fill="#444444")
-        self.canvas.create_text(x + width / 2, y + height + 38, text="Mileage (m)", anchor="n", font=("Arial", 11), fill="#202020")
-        self.canvas.create_text(x - 52, y + height / 2, text=y_label, anchor="center", angle=90, font=("Arial", 11), fill="#202020")
+            self.canvas.create_line(x, py, x + 6, py, fill="#444444")
+            self.canvas.create_text(x - 8, py, text=f"{tick:.{y_tick_digits}f}", anchor="e", font=(_PLOT_FONT_FAMILY, 10), fill="#444444")
+        self.canvas.create_text(x + width / 2, y + height + 38, text="Mileage (m)", anchor="n", font=(_PLOT_FONT_FAMILY, 11), fill="#202020")
+        self.canvas.create_text(x - 52, y + height / 2, text=y_label, anchor="center", angle=90, font=(_PLOT_FONT_FAMILY, 11), fill="#202020")
         points: list[float] = []
         for x_value, y_value in zip(xs, ys, strict=True):
             px = x + (float(x_value) - x0) / (x1 - x0) * width
@@ -1463,7 +1619,7 @@ class _LiveProgressWindow:
                 continue
             px = x + (float(xs[index]) - x0) / (x1 - x0) * width
             self.canvas.create_line(px, y, px, y + height, fill="#8a8a8a", dash=(4, 4))
-            self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=("Arial", 11), fill="#555555")
+            self.canvas.create_text(px + 6, y + 14, text=stage, anchor="w", font=(_PLOT_FONT_FAMILY, 11), fill="#555555")
             previous_stage = stage
         if latest_marker and latest_marker_point is not None:
             self.canvas.create_text(
@@ -1471,7 +1627,7 @@ class _LiveProgressWindow:
                 latest_marker_point[1],
                 text=latest_marker,
                 anchor="center",
-                font=("Arial", 16, "bold"),
+                font=(_PLOT_FONT_FAMILY, 16, "bold"),
                 fill="#d62728",
             )
 
@@ -1490,7 +1646,7 @@ class _LiveProgressWindow:
             y - 18,
             text="Wheel/Rail profile contact",
             anchor="w",
-            font=("Arial", 14),
+            font=(_PLOT_FONT_FAMILY, 14),
             fill="#202020",
         )
         self.canvas.create_rectangle(x, y, x + width, y + height, fill="#fbfbfb", outline="#c8c8c8")
@@ -1500,7 +1656,7 @@ class _LiveProgressWindow:
                 y + height / 2,
                 text="Waiting for contact profile data...",
                 anchor="center",
-                font=("Arial", 12),
+                font=(_PLOT_FONT_FAMILY, 12),
                 fill="#666666",
             )
             return
@@ -1555,14 +1711,14 @@ class _LiveProgressWindow:
         height: int,
     ) -> None:
         self.canvas.create_rectangle(x, y, x + width, y + height, fill="#fbfbfb", outline="#dddddd")
-        self.canvas.create_text(x + 8, y + 8, text=label, anchor="nw", font=("Arial", 11), fill="#404040")
+        self.canvas.create_text(x + 8, y + 8, text=label, anchor="nw", font=(_PLOT_FONT_FAMILY, 11), fill="#404040")
         if side_snapshot is None:
             self.canvas.create_text(
                 x + width / 2,
                 y + height / 2,
                 text="No profile",
                 anchor="center",
-                font=("Arial", 11),
+                font=(_PLOT_FONT_FAMILY, 11),
                 fill="#777777",
             )
             return
@@ -1600,8 +1756,8 @@ class _LiveProgressWindow:
         def py(value: float, z0: float, z1: float, band_y: int) -> float:
             return band_y + (float(value) - z0) / (z1 - z0) * band_height
 
-        self.canvas.create_text(x + 8, wheel_y, text="Wheel", anchor="sw", font=("Arial", 10), fill="#555555")
-        self.canvas.create_text(x + 8, rail_y, text="Rail", anchor="sw", font=("Arial", 10), fill="#555555")
+        self.canvas.create_text(x + 8, wheel_y, text="Wheel", anchor="sw", font=(_PLOT_FONT_FAMILY, 10), fill="#555555")
+        self.canvas.create_text(x + 8, rail_y, text="Rail", anchor="sw", font=(_PLOT_FONT_FAMILY, 10), fill="#555555")
 
         self._draw_profile_polyline(
             wheel,
@@ -1647,7 +1803,19 @@ class _LiveProgressWindow:
 
 def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -> int:
     recorder = _ProgressRecorder(every=args.plot_every)
-    checkpoint_summary = _checkpoint_summary_for_args(args, cut_freq=cut_freq)
+    pause_event = threading.Event()
+    pause_event.set()
+    checkpoint_summaries = _checkpoint_summaries_for_args(args, cut_freq=cut_freq)
+    checkpoint_summary = checkpoint_summaries[0] if checkpoint_summaries else None
+    if args.checkpoint_path is not None:
+        explicit_summary = _checkpoint_summary_for_path(args, args.checkpoint_path, cut_freq=cut_freq)
+        if explicit_summary is not None:
+            checkpoint_summaries = (explicit_summary,) + tuple(
+                summary
+                for summary in checkpoint_summaries
+                if Path(summary.get("path", "")) != Path(explicit_summary.get("path", ""))
+            )
+            checkpoint_summary = explicit_summary
     state: dict[str, Any] = {
         "done": False,
         "error": None,
@@ -1655,9 +1823,16 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
         "paths": None,
         "worker_started": False,
         "checkpoint_summary": checkpoint_summary,
-        "resume_checkpoint": bool(checkpoint_summary) if args.resume_checkpoint is None else bool(args.resume_checkpoint),
+        "checkpoint_summaries": checkpoint_summaries,
+        "save_checkpoints": bool(args.save_checkpoints),
+        "resume_checkpoint": False if args.resume_checkpoint is None else bool(args.resume_checkpoint),
+        "resume_checkpoint_path": args.checkpoint_path,
+        "validate_checkpoint_path": lambda path: _checkpoint_summary_for_path(args, path, cut_freq=cut_freq),
+        "pause_event": pause_event,
+        "paused": False,
         "resumed_text": "",
     }
+    progress_recorder = _PausableProgressRecorder(recorder, pause_event=pause_event, state=state)
 
     def worker() -> None:
         try:
@@ -1677,8 +1852,10 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 preload_cache_dir=args.preload_cache_dir,
                 history_retention_steps=args.history_retention_steps,
                 checkpoint_dir=args.checkpoint_dir,
+                save_checkpoints=bool(state.get("save_checkpoints")),
                 resume_checkpoint=bool(state.get("resume_checkpoint")),
-                progress_recorder=recorder,
+                resume_checkpoint_path=state.get("resume_checkpoint_path"),
+                progress_recorder=progress_recorder,
                 matlab_baseline_path=args.matlab_baseline,
                 abs_tolerance=args.abs_tol,
                 rel_tolerance=args.rel_tol,
@@ -1692,6 +1869,8 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 except Exception:
                     pass
         finally:
+            pause_event.set()
+            state["paused"] = False
             state["done"] = True
 
     thread: threading.Thread | None = None
@@ -1716,9 +1895,29 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
 
 
 def _checkpoint_summary_for_args(args: argparse.Namespace, *, cut_freq: float | None) -> dict[str, Any] | None:
+    summaries = _checkpoint_summaries_for_args(args, cut_freq=cut_freq)
+    return summaries[0] if summaries else None
+
+
+def _checkpoint_summaries_for_args(args: argparse.Namespace, *, cut_freq: float | None) -> tuple[dict[str, Any], ...]:
     if args.checkpoint_dir is None:
-        return None
-    settings = FullDefaultCaseSettings(
+        return ()
+    settings = _checkpoint_settings_for_args(args, cut_freq=cut_freq)
+    return list_default_full_case_checkpoints(settings=settings)
+
+
+def _checkpoint_summary_for_path(
+    args: argparse.Namespace,
+    checkpoint_path: str | Path,
+    *,
+    cut_freq: float | None,
+) -> dict[str, Any] | None:
+    settings = _checkpoint_settings_for_args(args, cut_freq=cut_freq)
+    return load_default_full_case_checkpoint_summary(checkpoint_path, settings=settings)
+
+
+def _checkpoint_settings_for_args(args: argparse.Namespace, *, cut_freq: float | None) -> FullDefaultCaseSettings:
+    return FullDefaultCaseSettings(
         cut_freq=cut_freq,
         dt=args.dt,
         n_steps_per_stage=args.steps,
@@ -1729,7 +1928,6 @@ def _checkpoint_summary_for_args(args: argparse.Namespace, *, cut_freq: float | 
         checkpoint_dir=args.checkpoint_dir,
         resume_checkpoint=False,
     )
-    return find_default_full_case_checkpoint(settings=settings)
 
 
 def _json_dumps(value: Any) -> str:
@@ -1772,7 +1970,18 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--checkpoint-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR / "checkpoints",
-        help="Save/resume latest matching run checkpoint here.",
+        help="Discover matching run checkpoints here, and save new checkpoints here when --save-checkpoints is used.",
+    )
+    parser.add_argument(
+        "--save-checkpoints",
+        action="store_true",
+        help="Save non-overwriting run checkpoints every checkpoint interval.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Resume from this specific checkpoint when --resume-checkpoint is used.",
     )
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument(
@@ -1818,7 +2027,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         preload_cache_dir=args.preload_cache_dir,
         history_retention_steps=args.history_retention_steps,
         checkpoint_dir=args.checkpoint_dir,
+        save_checkpoints=args.save_checkpoints,
         resume_checkpoint=bool(args.resume_checkpoint),
+        resume_checkpoint_path=args.checkpoint_path,
         matlab_baseline_path=args.matlab_baseline,
         abs_tolerance=args.abs_tol,
         rel_tolerance=args.rel_tol,

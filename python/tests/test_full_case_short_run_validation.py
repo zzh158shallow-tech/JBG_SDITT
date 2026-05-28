@@ -146,6 +146,10 @@ def test_progress_recorder_writes_only_final_outputs(tmp_path) -> None:
     assert ",0,0,130,250,410,510" in csv
     svg = svg_path.read_text(encoding="utf-8")
     assert "<polyline" in svg
+    assert 'font-family="Times New Roman"' in svg
+    assert 'shape-rendering="geometricPrecision"' in svg
+    assert '<line x1="70" y1=' in svg and 'x2="76"' in svg
+    assert '>0.0</text>' in svg
     assert "Mileage (m)" in svg
     assert "Patch force magnitude (kN)" in svg
     assert "FF-L1" in svg
@@ -168,6 +172,9 @@ def test_full_case_short_run_validation_parses_live_window_and_save_progress_fla
             "cache",
             "--checkpoint-dir",
             "checkpoints",
+            "--save-checkpoints",
+            "--checkpoint-path",
+            "checkpoints/manual.pkl",
             "--resume-checkpoint",
         ]
     )
@@ -177,7 +184,17 @@ def test_full_case_short_run_validation_parses_live_window_and_save_progress_fla
     assert args.plot_every == 25
     assert str(args.preload_cache_dir) == "cache"
     assert str(args.checkpoint_dir) == "checkpoints"
+    assert args.save_checkpoints
+    assert str(args.checkpoint_path) == "checkpoints/manual.pkl"
     assert args.resume_checkpoint is True
+
+
+def test_full_case_short_run_validation_defaults_to_not_saving_checkpoints() -> None:
+    args = _parse_args([])
+
+    assert not args.save_checkpoints
+    assert args.resume_checkpoint is None
+    assert args.checkpoint_path is None
 
 
 def test_format_elapsed_time_uses_stable_clock_format() -> None:

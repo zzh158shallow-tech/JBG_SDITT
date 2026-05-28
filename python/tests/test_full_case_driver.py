@@ -18,6 +18,7 @@ from sditt.simulation import (
     FullDefaultCaseSettings,
     MissingFullCasePhysicsError,
     find_default_full_case_checkpoint,
+    list_default_full_case_checkpoints,
     prepare_default_full_case,
     run_default_full_case_driver,
 )
@@ -368,7 +369,7 @@ def test_preload_cache_reuses_completed_preload_state() -> None:
     assert all(event.step_wall_time >= 0.0 for event in second_events)
 
 
-def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
+def test_run_checkpoint_saves_non_overwriting_archives_and_resumes_latest_matching_state() -> None:
     checkpoint_dir = Path("outputs") / "test_run_checkpoints" / uuid.uuid4().hex
     first_events = []
     resumed_events = []
@@ -377,20 +378,25 @@ def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
         dt=1.0e-4,
         stage_end_mileage={"Preload": 32.03, "Cal": 32.12},
         checkpoint_dir=checkpoint_dir,
-        checkpoint_interval_m=0.05,
+        save_checkpoints=True,
+        checkpoint_interval_m=0.03,
         history_retention_steps=None,
     )
 
     first = run_default_full_case_driver(settings=replace(settings, progress_callback=first_events.append))
+    summaries = list_default_full_case_checkpoints(settings=settings)
     summary = find_default_full_case_checkpoint(settings=settings)
     resumed = run_default_full_case_driver(
-        settings=replace(settings, resume_checkpoint=True, progress_callback=resumed_events.append)
+        settings=replace(settings, save_checkpoints=False, resume_checkpoint=True, progress_callback=resumed_events.append)
     )
 
     assert first.checkpoint_status == "saved"
     assert first.checkpoint_path is not None
     assert first.checkpoint_path.exists()
+    assert len(summaries) >= 2
+    assert len({Path(item["path"]).name for item in summaries}) == len(summaries)
     assert summary is not None
+    assert summary["path"] == summaries[0]["path"]
     assert summary["stage"] in {"Preload", "Cal"}
     assert resumed.resumed_from_checkpoint
     assert resumed.resumed_checkpoint_mileage == pytest.approx(float(summary["front_mileage"]))
@@ -400,6 +406,69 @@ def test_run_checkpoint_saves_and_resumes_latest_matching_state() -> None:
     assert [event.front_mileage for event in resumed_events[: len(replayed)]] == pytest.approx(
         [event.front_mileage for event in replayed]
     )
+
+
+def test_run_checkpoint_resumes_from_selected_archive_instead_of_latest() -> None:
+    checkpoint_dir = Path("outputs") / "test_run_checkpoints" / uuid.uuid4().hex
+    settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        stage_end_mileage={"Preload": 32.03, "Cal": 32.12},
+        checkpoint_dir=checkpoint_dir,
+        save_checkpoints=True,
+        checkpoint_interval_m=0.03,
+        history_retention_steps=None,
+    )
+
+    run_default_full_case_driver(settings=settings)
+    summaries = list_default_full_case_checkpoints(settings=settings)
+    assert len(summaries) >= 2
+    selected = summaries[-1]
+    latest = summaries[0]
+    resumed = run_default_full_case_driver(
+        settings=replace(
+            settings,
+            save_checkpoints=False,
+            resume_checkpoint=True,
+            resume_checkpoint_path=selected["path"],
+        )
+    )
+
+    assert float(selected["front_mileage"]) < float(latest["front_mileage"])
+    assert resumed.resumed_from_checkpoint
+    assert resumed.checkpoint_path == Path(selected["path"])
+    assert resumed.resumed_checkpoint_mileage == pytest.approx(float(selected["front_mileage"]))
+
+
+def test_run_checkpoint_ignores_incompatible_archives() -> None:
+    checkpoint_dir = Path("outputs") / "test_run_checkpoints" / uuid.uuid4().hex
+    settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        stage_end_mileage={"Preload": 32.03, "Cal": 32.12},
+        checkpoint_dir=checkpoint_dir,
+        save_checkpoints=True,
+        checkpoint_interval_m=0.05,
+        history_retention_steps=None,
+    )
+
+    run_default_full_case_driver(settings=settings)
+    compatible = list_default_full_case_checkpoints(settings=settings)
+    incompatible = list_default_full_case_checkpoints(settings=replace(settings, dt=2.0e-4))
+    resumed = run_default_full_case_driver(
+        settings=replace(
+            settings,
+            dt=2.0e-4,
+            save_checkpoints=False,
+            resume_checkpoint=True,
+            resume_checkpoint_path=compatible[0]["path"],
+        )
+    )
+
+    assert compatible
+    assert incompatible == ()
+    assert not resumed.resumed_from_checkpoint
+    assert resumed.checkpoint_status == "miss"
 
 
 def _initial_stage_front_mileage_for_test(result) -> float:

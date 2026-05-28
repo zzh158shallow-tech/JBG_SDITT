@@ -135,7 +135,9 @@ class FullDefaultCaseSettings:
     preload_cache_dir: str | Path | None = None
     history_retention_steps: int | None = 256
     checkpoint_dir: str | Path | None = None
+    save_checkpoints: bool = False
     resume_checkpoint: bool = False
+    resume_checkpoint_path: str | Path | None = None
     checkpoint_interval_m: float | None = 10.0
     iteration_settings: CoupledIterationSettings = CoupledIterationSettings(
         max_iterations=11,
@@ -404,12 +406,19 @@ def _preload_cache_key(preparation: FullDefaultCasePreparation) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def _run_checkpoint_path(preparation: FullDefaultCasePreparation) -> Path | None:
+def _run_checkpoint_dir(preparation: FullDefaultCasePreparation) -> Path | None:
     cache_dir = preparation.settings.checkpoint_dir
     if cache_dir is None:
         return None
+    return Path(cache_dir)
+
+
+def _run_checkpoint_path(preparation: FullDefaultCasePreparation) -> Path | None:
+    checkpoint_dir = _run_checkpoint_dir(preparation)
+    if checkpoint_dir is None:
+        return None
     key = _run_checkpoint_key(preparation)
-    return Path(cache_dir) / f"checkpoint_{key}.pkl"
+    return checkpoint_dir / f"checkpoint_{key}.pkl"
 
 
 def _run_checkpoint_key(preparation: FullDefaultCasePreparation) -> str:
@@ -493,26 +502,118 @@ def _load_run_checkpoint(preparation: FullDefaultCasePreparation, checkpoint_pat
     return data if isinstance(data, dict) else None
 
 
-def find_default_full_case_checkpoint(
-    *,
-    repo_root: str | Path | None = None,
-    settings: FullDefaultCaseSettings | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
-) -> dict[str, Any] | None:
-    preparation = prepare_default_full_case(repo_root=repo_root, settings=settings, operating_case=operating_case)
-    checkpoint_path = _run_checkpoint_path(preparation)
-    if checkpoint_path is None:
-        return None
-    data = _load_run_checkpoint(preparation, checkpoint_path)
-    if data is None:
-        return None
+def _run_checkpoint_summary(checkpoint_path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    try:
+        mtime_ns = int(checkpoint_path.stat().st_mtime_ns)
+    except OSError:
+        mtime_ns = 0
     return {
         "path": checkpoint_path,
         "stage": data.get("stage"),
         "step_index": data.get("step_index"),
         "time": data.get("time"),
         "front_mileage": data.get("front_mileage"),
+        "mtime_ns": mtime_ns,
     }
+
+
+def _run_checkpoint_sort_key(summary: dict[str, Any]) -> tuple[float, float, int, int]:
+    return (
+        float(summary.get("front_mileage") or 0.0),
+        float(summary.get("time") or 0.0),
+        int(summary.get("step_index") or 0),
+        int(summary.get("mtime_ns") or 0),
+    )
+
+
+def _list_compatible_run_checkpoints(preparation: FullDefaultCasePreparation) -> tuple[dict[str, Any], ...]:
+    checkpoint_dir = _run_checkpoint_dir(preparation)
+    if checkpoint_dir is None or not checkpoint_dir.exists():
+        return ()
+    key = _run_checkpoint_key(preparation)
+    summaries: list[dict[str, Any]] = []
+    for checkpoint_path in checkpoint_dir.glob(f"checkpoint_{key}*.pkl"):
+        data = _load_run_checkpoint(preparation, checkpoint_path)
+        if data is not None:
+            summaries.append(_run_checkpoint_summary(checkpoint_path, data))
+    summaries.sort(key=_run_checkpoint_sort_key, reverse=True)
+    return tuple(summaries)
+
+
+def _selected_run_checkpoint(
+    preparation: FullDefaultCasePreparation,
+) -> tuple[Path, dict[str, Any]] | None:
+    checkpoint_path = preparation.settings.resume_checkpoint_path
+    if checkpoint_path is not None:
+        selected_path = Path(checkpoint_path)
+        data = _load_run_checkpoint(preparation, selected_path)
+        return None if data is None else (selected_path, data)
+    summaries = _list_compatible_run_checkpoints(preparation)
+    if not summaries:
+        return None
+    selected_path = Path(summaries[0]["path"])
+    data = _load_run_checkpoint(preparation, selected_path)
+    return None if data is None else (selected_path, data)
+
+
+def find_default_full_case_checkpoint(
+    *,
+    repo_root: str | Path | None = None,
+    settings: FullDefaultCaseSettings | None = None,
+    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+) -> dict[str, Any] | None:
+    summaries = list_default_full_case_checkpoints(
+        repo_root=repo_root,
+        settings=settings,
+        operating_case=operating_case,
+    )
+    return summaries[0] if summaries else None
+
+
+def list_default_full_case_checkpoints(
+    *,
+    repo_root: str | Path | None = None,
+    settings: FullDefaultCaseSettings | None = None,
+    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+) -> tuple[dict[str, Any], ...]:
+    preparation = prepare_default_full_case(repo_root=repo_root, settings=settings, operating_case=operating_case)
+    return _list_compatible_run_checkpoints(preparation)
+
+
+def load_default_full_case_checkpoint_summary(
+    checkpoint_path: str | Path,
+    *,
+    repo_root: str | Path | None = None,
+    settings: FullDefaultCaseSettings | None = None,
+    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+) -> dict[str, Any] | None:
+    preparation = prepare_default_full_case(repo_root=repo_root, settings=settings, operating_case=operating_case)
+    path = Path(checkpoint_path)
+    data = _load_run_checkpoint(preparation, path)
+    return None if data is None else _run_checkpoint_summary(path, data)
+
+
+def _run_checkpoint_archive_path(
+    preparation: FullDefaultCasePreparation,
+    *,
+    stage: SimulationStage,
+    accepted: Any,
+    interval: float,
+) -> Path | None:
+    checkpoint_dir = _run_checkpoint_dir(preparation)
+    if checkpoint_dir is None:
+        return None
+    rail = accepted.rail_response
+    key = _run_checkpoint_key(preparation)
+    bucket = _checkpoint_mileage_bucket(float(rail.front_mileage), interval)
+    stage_label = "".join(char if char.isalnum() else "_" for char in str(stage))
+    mileage_label = f"{float(rail.front_mileage):.3f}".replace("-", "neg").replace(".", "p")
+    step_label = f"{int(accepted.step_index):08d}"
+    timestamp_label = str(time.time_ns())
+    return (
+        checkpoint_dir
+        / f"checkpoint_{key}_{stage_label}_bucket{bucket:06d}_m{mileage_label}_step{step_label}_{timestamp_label}.pkl"
+    )
 
 
 def _write_run_checkpoint(
@@ -726,16 +827,25 @@ def run_default_full_case_driver(
     acceleration_history_seed: np.ndarray | None = None
     preload_cache_path = _preload_cache_path(preparation)
     preload_cache_status = "disabled" if preload_cache_path is None else "miss"
-    checkpoint_path = _run_checkpoint_path(preparation)
-    checkpoint_status = "disabled" if checkpoint_path is None else "miss"
+    checkpoint_dir = _run_checkpoint_dir(preparation)
+    checkpoint_save_enabled = (
+        checkpoint_dir is not None
+        and preparation.settings.save_checkpoints
+        and preparation.settings.frozen_contact_input is None
+    )
+    checkpoint_path: Path | None = None
+    checkpoint_status = "miss" if checkpoint_save_enabled or preparation.settings.resume_checkpoint else "disabled"
     resumed_from_checkpoint = False
     resumed_checkpoint_mileage: float | None = None
+    resume_checkpoint_data: dict[str, Any] | None = None
     stages_to_run = tuple(preparation.operating_case.simulation_stages)
     preload_progress_events: list[FullCaseProgressEvent] = []
     checkpoint_progress_events: list[FullCaseProgressEvent] = []
-    if checkpoint_path is not None and preparation.settings.resume_checkpoint and preparation.settings.frozen_contact_input is None:
-        checkpoint = _load_run_checkpoint(preparation, checkpoint_path)
-        if checkpoint is not None:
+    if preparation.settings.resume_checkpoint and preparation.settings.frozen_contact_input is None:
+        selected_checkpoint = _selected_run_checkpoint(preparation)
+        if selected_checkpoint is not None:
+            checkpoint_path, checkpoint = selected_checkpoint
+            resume_checkpoint_data = checkpoint
             checkpoint_status = "hit"
             resumed_from_checkpoint = True
             resumed_checkpoint_mileage = float(checkpoint["front_mileage"])
@@ -785,12 +895,11 @@ def run_default_full_case_driver(
         stage_step_index0 = 0
         stage_time0 = 0.0
         original_stage_start_front_mileage = stage_start_front_mileage
-        if resumed_from_checkpoint and checkpoint_path is not None and checkpoint_status == "hit":
-            checkpoint = _load_run_checkpoint(preparation, checkpoint_path)
-            if checkpoint is not None and str(checkpoint["stage"]) == stage:
-                stage_step_index0 = int(checkpoint["step_index"])
-                stage_time0 = float(checkpoint["time"])
-                original_stage_start_front_mileage = float(checkpoint["original_stage_start_front_mileage"])
+        if resumed_from_checkpoint and resume_checkpoint_data is not None and checkpoint_status == "hit":
+            if str(resume_checkpoint_data["stage"]) == stage:
+                stage_step_index0 = int(resume_checkpoint_data["step_index"])
+                stage_time0 = float(resume_checkpoint_data["time"])
+                original_stage_start_front_mileage = float(resume_checkpoint_data["original_stage_start_front_mileage"])
                 stage_start_front_mileage = original_stage_start_front_mileage
         stage_wall_start = time.perf_counter()
         current_front_mileage = stage_start_front_mileage + preparation.operating_case.vlc * stage_time0
@@ -821,10 +930,9 @@ def run_default_full_case_driver(
             stage_start_front_mileage = current_front_mileage
             continue
         mirror_checkpoint_progress = (
-            checkpoint_path is not None
+            checkpoint_save_enabled
             and preparation.settings.checkpoint_interval_m is not None
             and preparation.settings.checkpoint_interval_m > 0.0
-            and preparation.settings.frozen_contact_input is None
         )
         mirror_preload_progress = (
             stage == "Preload"
@@ -849,7 +957,6 @@ def run_default_full_case_driver(
         )
         checkpoint_callback = _run_checkpoint_callback(
             preparation,
-            checkpoint_path,
             stage=stage,
             original_stage_start_front_mileage=original_stage_start_front_mileage,
             initial_front_mileage=current_front_mileage,
@@ -857,10 +964,12 @@ def run_default_full_case_driver(
         )
 
         def accepted_callback(accepted: Any) -> None:
-            nonlocal checkpoint_status
+            nonlocal checkpoint_path, checkpoint_status
             if progress_callback is not None:
                 progress_callback(accepted)
-            if checkpoint_callback is not None and checkpoint_callback(accepted):
+            saved_checkpoint_path = None if checkpoint_callback is None else checkpoint_callback(accepted)
+            if saved_checkpoint_path is not None:
+                checkpoint_path = saved_checkpoint_path
                 checkpoint_status = "saved"
 
         history = run_coupled_time_iteration(
@@ -951,25 +1060,38 @@ def _stages_from(stages: tuple[SimulationStage, ...], start_stage: str) -> tuple
 
 def _run_checkpoint_callback(
     preparation: FullDefaultCasePreparation,
-    checkpoint_path: Path | None,
     *,
     stage: SimulationStage,
     original_stage_start_front_mileage: float,
     initial_front_mileage: float,
     progress_events: Callable[[], tuple[FullCaseProgressEvent, ...]] | None = None,
-) -> Callable[[Any], bool] | None:
+) -> Callable[[Any], Path | None] | None:
     interval = preparation.settings.checkpoint_interval_m
-    if checkpoint_path is None or interval is None or interval <= 0.0:
+    if (
+        not preparation.settings.save_checkpoints
+        or preparation.settings.checkpoint_dir is None
+        or preparation.settings.frozen_contact_input is not None
+        or interval is None
+        or interval <= 0.0
+    ):
         return None
     last_bucket = _checkpoint_mileage_bucket(initial_front_mileage, interval)
 
-    def save_if_crossed(accepted: Any) -> bool:
+    def save_if_crossed(accepted: Any) -> Path | None:
         nonlocal last_bucket
         rail = accepted.rail_response
         current_bucket = _checkpoint_mileage_bucket(float(rail.front_mileage), interval)
         if current_bucket == last_bucket:
-            return False
+            return None
         last_bucket = current_bucket
+        checkpoint_path = _run_checkpoint_archive_path(
+            preparation,
+            stage=stage,
+            accepted=accepted,
+            interval=interval,
+        )
+        if checkpoint_path is None:
+            return None
         _write_run_checkpoint(
             preparation,
             checkpoint_path,
@@ -978,7 +1100,7 @@ def _run_checkpoint_callback(
             accepted=accepted,
             progress_events=() if progress_events is None else progress_events(),
         )
-        return True
+        return checkpoint_path
 
     return save_if_crossed
 
