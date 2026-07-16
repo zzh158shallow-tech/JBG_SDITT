@@ -7,6 +7,7 @@ import pytest
 
 from sditt.contact.full_case import _creepage_inputs, _wheel_pose, _wheel_rate
 from sditt.simulation.full_case import _progress_profile_selection
+from sditt.track import TrackIrregularitySettings, build_track_irregularity_profile
 
 
 def test_rigid_wheelset_pose_and_rate_follow_matlab_dof_layout() -> None:
@@ -85,6 +86,44 @@ def test_creepage_inputs_include_rigid_wheel_kinematics_and_r2_rail_beam_velocit
     assert np.allclose(vjd_r, expected_vjd_r)
     assert np.allclose(vsdc, expected_vsdc)
     assert np.allclose(vjsdc, expected_vjsdc)
+
+
+def test_creepage_inputs_include_track_irregularity_velocity() -> None:
+    inp_par = {
+        "N_track": 5,
+        "NM_FW": 0,
+        "Nw": 4,
+        "N_ConPatch": 2,
+        "Exp_DummyRail": ["L1", "R1"],
+        "Exp_DummyRail_L": ["L1"],
+        "Vlc": 97.2222222222,
+    }
+    pose = SimpleNamespace(roll=0.0, yaw=0.0)
+    wheel_rate = {"trans": np.zeros(3), "roll_rate": 0.0, "spin_rate": 0.0, "yaw_rate": 0.0}
+    rail_response = SimpleNamespace(
+        vel_rail=np.zeros((8, 6), dtype=float),
+        rail_beam_motion={"Vel_Z": {}},
+    )
+    profile = build_track_irregularity_profile(TrackIrregularitySettings(model="china-ballastless", seed=5))
+    assert profile is not None
+    sample = profile.sample(54.0)
+
+    _, vjd_r, _, _ = _creepage_inputs(
+        rail_response,
+        inp_par,
+        {},
+        wheel_rate,
+        pose,
+        np.array([[0.0, 0.0, 0.43]]),
+        np.array([np.eye(3)]),
+        np.array([2]),
+        wheel_index=0,
+        track_irregularity_sample=sample,
+    )
+
+    expected_y, expected_z = sample.rail_velocity("R", inp_par["Vlc"])
+    assert vjd_r[0, 1] == pytest.approx(expected_y)
+    assert vjd_r[0, 2] == pytest.approx(expected_z)
 
 
 def test_progress_profile_selection_prefers_front_wheelset_for_stable_live_display() -> None:

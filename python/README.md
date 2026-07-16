@@ -160,6 +160,26 @@ The original turnout contact route remains available from the command line:
 python -m sditt.validation.full_case_short_run --rail-layout turnout --steps 2 --cut-freq 50
 ```
 
+Track irregularity is off by default so existing baselines remain unchanged.
+Enable the Chinese high-speed ballastless-track spectrum with a reproducible
+random-phase trigonometric-series reconstruction as follows:
+
+```bash
+python -m sditt.validation.full_case_short_run \
+  --rail-layout interval \
+  --track-irregularity china-ballastless \
+  --irregularity-seed 20260716 \
+  --full-size \
+  --matlab-mileage-endpoints \
+  --save-progress
+```
+
+The model synthesizes vertical profile (高低), alignment (轨向), cross level
+(水平), and gauge (轨距) over wavelengths 2–200 m. It applies both displacement
+and the corresponding velocity to wheel–rail contact. With `--save-progress`,
+the `progress/` directory also contains `track_irregularity.csv`,
+`track_irregularity_spectrum.csv`, and `track_irregularity.svg`.
+
 For the straight-layout route, the current driver evaluates the
 CRH380A_v6 nonlinear vehicle damper stage, the default rigid-wheel contact
 route, and the MATLAB-style iteration/output storage path. For this straight

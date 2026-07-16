@@ -66,6 +66,10 @@ will fail even though the source code is installed correctly.
 - The realtime force display defaults to the first wheelset only. Interval mode
   shows `FF-L1` and `FF-R1`; turnout mode also shows `FF-R2` and `FF-R3`.
   The progress CSV still records all patch force columns.
+- Track irregularity is disabled by default. Use
+  `--track-irregularity china-ballastless` to enable the Chinese high-speed
+  ballastless-track spectrum reconstructed with a random-phase trigonometric
+  series over wavelengths 2–200 m. The default reproducible seed is 20260716.
 
 ## Common Run Commands
 
@@ -84,6 +88,18 @@ virtual environment from the setup section, activate it first:
 - Full MATLAB-mileage endpoint run with realtime window:
   - `cd python`
   - `python -m sditt.validation.full_case_short_run --live-window --full-size --matlab-mileage-endpoints`
+- Full interval run with Chinese ballastless-track irregularity:
+  - `cd python`
+  - ```bash
+    python -m sditt.validation.full_case_short_run \
+      --rail-layout interval \
+      --track-irregularity china-ballastless \
+      --irregularity-seed 20260716 \
+      --live-window \
+      --full-size \
+      --matlab-mileage-endpoints \
+      --save-progress
+    ```
 - Full MATLAB-mileage endpoint run with realtime window, final progress output,
   and run checkpoints:
   - Windows PowerShell:

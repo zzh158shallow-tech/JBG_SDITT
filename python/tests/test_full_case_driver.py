@@ -28,7 +28,7 @@ from sditt.simulation.full_case import (
     _run_checkpoint_key,
     _stage_step_count,
 )
-from sditt.track import rail_dyn_modal_ft, wr_force_modal_ft
+from sditt.track import TrackIrregularitySettings, rail_dyn_modal_ft, wr_force_modal_ft
 from sditt.vehicle import build_nonlinear_damper_response, wr_force_vehicle_sys_rotation_iii
 
 
@@ -145,6 +145,61 @@ def test_interval_and_turnout_use_distinct_cache_and_checkpoint_fingerprints() -
 
     assert _preload_cache_key(interval) != _preload_cache_key(turnout)
     assert _run_checkpoint_key(interval) != _run_checkpoint_key(turnout)
+
+
+def test_irregularity_seed_changes_cache_and_checkpoint_fingerprints() -> None:
+    first_settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        track_irregularity=TrackIrregularitySettings(model="china-ballastless", seed=1),
+    )
+    second_settings = replace(
+        first_settings,
+        track_irregularity=TrackIrregularitySettings(model="china-ballastless", seed=2),
+    )
+    first = prepare_default_full_case(settings=first_settings)
+    second = prepare_default_full_case(settings=second_settings)
+
+    assert _preload_cache_key(first) != _preload_cache_key(second)
+    assert _run_checkpoint_key(first) != _run_checkpoint_key(second)
+
+
+@pytest.mark.parametrize("rail_layout", ["interval", "turnout"])
+def test_full_case_applies_same_side_irregularity_to_all_dummy_rails(rail_layout: str) -> None:
+    settings = FullDefaultCaseSettings(
+        cut_freq=50.0,
+        n_steps_per_stage=1,
+        track_irregularity=TrackIrregularitySettings(model="china-ballastless", seed=123),
+    )
+    result = run_default_full_case_driver(
+        settings=settings,
+        operating_case=DefaultOperatingCase(rail_layout=rail_layout),
+    )
+    cal = result.stages[-1]
+    contact = cal.history.contact_geometry[-1].wheel_rail_contact
+    assert contact is not None
+    assert result.preparation.track_irregularity_profile is not None
+
+    for wheel_index, wheelset in enumerate(result.preparation.operating_case.wheelsets):
+        metadata = contact.con_ws[wheelset]["Track_Irregularity"]
+        assert metadata
+        track_profile = contact.track_profiles[wheelset]
+        for patch_index, (dummy_rail, side) in enumerate(
+            zip(
+                result.preparation.operating_case.dummy_rails,
+                result.preparation.operating_case.dummy_rail_wheel_side,
+                strict=True,
+            )
+        ):
+            contact_index = result.preparation.operating_case.n_contact_patch * wheel_index + patch_index
+            irregularity_y, irregularity_z = metadata["rail_displacement_m"][side]
+            assert track_profile.offsets[dummy_rail][0] == pytest.approx(
+                cal.history.rail_response[-1].dis_rail[contact_index, 1] + irregularity_y
+            )
+            assert track_profile.offsets[dummy_rail][1] == pytest.approx(
+                0.6 + cal.history.rail_response[-1].dis_rail[contact_index, 2] + irregularity_z
+            )
+        for side in ("L", "R"):
+            assert np.all(np.isfinite(metadata["rail_velocity_m_per_s"][side]))
 
 
 def test_run_default_full_case_driver_converges_with_default_full_size_settings() -> None:

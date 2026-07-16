@@ -17,6 +17,7 @@ from sditt.contact.forces import (
 )
 from sditt.contact.geometry import WheelPose2D, multi_point_contact_geometry, single_point_contact_geometry
 from sditt.profiles.geometry import TrackProfileSet, WheelProfileSet, build_track_profiles, contact_tables, offset_profile_to_track
+from sditt.track.irregularity import TrackIrregularityProfile, TrackIrregularitySample
 
 
 _ELLIPTIC_INTEGRAL_PHI = np.linspace(0.0, pi / 2.0, 2001)
@@ -64,6 +65,7 @@ def solve_default_wheel_rail_contact(
     fixed_d0_by_wheelset: Mapping[str, float] | None = None,
     previous_relvel_max_by_wheelset: Mapping[str, Mapping[str, float]] | None = None,
     use_cal_d0_trace: bool = True,
+    track_irregularity: TrackIrregularityProfile | None = None,
 ) -> FullCaseWheelRailContactResult:
     """Assemble the default rigid-wheel full-case contact route.
 
@@ -103,6 +105,7 @@ def solve_default_wheel_rail_contact(
 
     for wheel_index, wheelset in enumerate(exp_ws):
         mileage = float(front_mileage) - wheel_distances[wheelset]
+        irregularity_sample = track_irregularity.sample(mileage) if track_irregularity is not None else None
         track_profile = _build_track_profile_for_wheelset(
             inp_par,
             rail_profile_selection,
@@ -114,6 +117,7 @@ def solve_default_wheel_rail_contact(
             left_dummy_rails,
             right_dummy_rails,
             track_parameters,
+            irregularity_sample,
         )
         track_profiles[wheelset] = track_profile
 
@@ -135,6 +139,7 @@ def solve_default_wheel_rail_contact(
 
         con_ws[wheelset] = {
             "Mileage": mileage,
+            "Track_Irregularity": _track_irregularity_payload(irregularity_sample, float(inp_par["Vlc"])),
             "profile_r": {
                 "L": np.asarray(track_profile.profile["L"], dtype=float),
                 "R": np.asarray(track_profile.profile["R"], dtype=float),
@@ -181,6 +186,7 @@ def solve_default_wheel_rail_contact(
                     if previous_relvel_max_by_wheelset is not None
                     else None
                 ),
+                track_irregularity_sample=irregularity_sample,
             )
             con_ws[wheelset]["Normal_Force"][side] = side_result["normal_force"]
             con_ws[wheelset]["Con_wheel_2"][side] = side_result["con_wheel_2"]
@@ -285,18 +291,24 @@ def _build_track_profile_for_wheelset(
     left_dummy_rails: tuple[str, ...],
     right_dummy_rails: tuple[str, ...],
     track_parameters: DefaultTrackContactParameters,
+    track_irregularity_sample: TrackIrregularitySample | None,
 ) -> TrackProfileSet:
     n_contact_patch = int(inp_par["N_ConPatch"])
     offset_profiles: dict[str, Any] = {}
     for patch_index, (dummy_rail, wheel_side) in enumerate(zip(exp_dummy_rail, exp_dummy_rail_side, strict=True)):
         record = rail_profile_selection[dummy_rail].by_station[wheelset]
         contact_index = n_contact_patch * wheel_index + patch_index
+        irregularity_y = irregularity_z = 0.0
+        if track_irregularity_sample is not None:
+            irregularity_y, irregularity_z = track_irregularity_sample.rail_displacement_m[wheel_side]
         offset_profiles[dummy_rail] = offset_profile_to_track(
             record,
             wheel_side=wheel_side,
             ori_prr=track_parameters.ori_prr,
             dis_rail_y=float(dis_rail[contact_index, 1]),
             dis_rail_z=float(dis_rail[contact_index, 2]),
+            irregularity_y=float(irregularity_y),
+            irregularity_z=float(irregularity_z),
             gauge=track_parameters.gauge,
             vertical_offset=track_parameters.vertical_offset,
         )
@@ -325,6 +337,7 @@ def _solve_wheel_side_contact(
     d0: float,
     exp_dummy_rail: list[str],
     previous_relvel_max_by_dummy_rail: Mapping[str, float] | None,
+    track_irregularity_sample: TrackIrregularitySample | None,
 ) -> dict[str, np.ndarray]:
     rail_profile = np.asarray(track_profile.profile[side], dtype=float)
     if rail_profile.size == 0:
@@ -446,6 +459,7 @@ def _solve_wheel_side_contact(
         transforms,
         patch_ids,
         wheel_index,
+        track_irregularity_sample,
     )
     rel_ratio, relvel_max = _relative_velocity_ratio(
         vsdc[:, 2],
@@ -671,6 +685,7 @@ def _creepage_inputs(
     transforms: np.ndarray,
     patch_ids: np.ndarray,
     wheel_index: int,
+    track_irregularity_sample: TrackIrregularitySample | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     vjd = np.zeros((con_wheel_2.shape[0], 3), dtype=float)
     vjd_r = np.zeros((con_wheel_2.shape[0], 3), dtype=float)
@@ -719,12 +734,35 @@ def _creepage_inputs(
         contact_index = n_contact_patch * wheel_index + patch_id - 1
         vjd_r[patch_index, :] = np.asarray(rail_response.vel_rail[contact_index, :3], dtype=float)
         dummy_rail = exp_dummy_rail[patch_id - 1]
+        if track_irregularity_sample is not None:
+            side = "L" if dummy_rail in tuple(inp_par["Exp_DummyRail_L"]) else "R"
+            irregularity_velocity_y, irregularity_velocity_z = track_irregularity_sample.rail_velocity(
+                side,
+                float(inp_par["Vlc"]),
+            )
+            vjd_r[patch_index, 1] += irregularity_velocity_y
+            vjd_r[patch_index, 2] += irregularity_velocity_z
         if dummy_rail == "R2" and dummy_rail in rail_beam_vel_z:
             vjd_r[patch_index, 2] += float(rail_beam_vel_z[dummy_rail][wheel_index, 0])
         vsdc[patch_index, :] = _right_matrix_divide(vjd[patch_index, :] - vjd_r[patch_index, :], transforms[patch_index])
         vjsdc[patch_index, :] = _right_matrix_divide(angvel_track, transforms[patch_index])
 
     return vjd, vjd_r, vsdc, vjsdc
+
+
+def _track_irregularity_payload(
+    sample: TrackIrregularitySample | None,
+    speed: float,
+) -> dict[str, Any]:
+    if sample is None:
+        return {}
+    return {
+        "mileage": sample.mileage,
+        "components_m": dict(sample.components_m),
+        "component_slopes": dict(sample.component_slopes),
+        "rail_displacement_m": {side: tuple(value) for side, value in sample.rail_displacement_m.items()},
+        "rail_velocity_m_per_s": {side: sample.rail_velocity(side, speed) for side in ("L", "R")},
+    }
 
 
 def _wheelset_orientation(roll: float, yaw: float) -> np.ndarray:

@@ -23,6 +23,12 @@ from sditt.simulation import (
     load_default_full_case_checkpoint_summary,
     run_default_full_case_driver,
 )
+from sditt.track import (
+    TrackIrregularityModel,
+    TrackIrregularitySettings,
+    build_track_irregularity_profile,
+    export_track_irregularity,
+)
 
 
 DEFAULT_OUTPUT_DIR = Path("python/outputs/full_case_short_run")
@@ -78,6 +84,8 @@ def build_python_short_run_snapshot(
     resume_checkpoint_path: str | Path | None = None,
     progress_callback: Any = None,
     rail_layout: RailLayout = "interval",
+    track_irregularity: TrackIrregularityModel = "none",
+    irregularity_seed: int = 20260716,
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
 
@@ -94,6 +102,7 @@ def build_python_short_run_snapshot(
         resume_checkpoint=resume_checkpoint,
         resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_callback,
+        track_irregularity=TrackIrregularitySettings(model=track_irregularity, seed=irregularity_seed),
     )
     result = run_default_full_case_driver(
         settings=settings,
@@ -104,11 +113,13 @@ def build_python_short_run_snapshot(
 
 def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]:
     preparation = result.preparation
+    irregularity = _track_irregularity_snapshot(preparation)
     return {
         "schema": "sditt-full-case-short-run-v1",
         "source": "python",
         "settings": {
             "rail_layout": preparation.operating_case.rail_layout,
+            "track_irregularity": irregularity,
             "cut_freq": preparation.settings.cut_freq,
             "dt": preparation.settings.dt,
             "n_steps_per_stage": preparation.settings.n_steps_per_stage,
@@ -148,9 +159,28 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "n_track": preparation.system.layout.n_track,
             "wheelsets": list(preparation.operating_case.wheelsets),
             "missing_stages": [stage.name for stage in preparation.missing_stages],
+            "track_irregularity": irregularity,
         },
         "stages": [_stage_snapshot(stage) for stage in result.stages],
         "timing": _timing_snapshot(result),
+    }
+
+
+def _track_irregularity_snapshot(preparation: Any) -> dict[str, Any]:
+    profile = preparation.track_irregularity_profile
+    if profile is not None:
+        return profile.summary()
+    settings = preparation.settings.track_irregularity
+    return {
+        "model": settings.model,
+        "seed": settings.seed,
+        "min_wavelength_m": settings.min_wavelength_m,
+        "max_wavelength_m": settings.max_wavelength_m,
+        "min_spatial_frequency_1_per_m": settings.min_spatial_frequency,
+        "max_spatial_frequency_1_per_m": settings.max_spatial_frequency,
+        "spatial_frequency_step_1_per_m": settings.spatial_frequency_step,
+        "theoretical_rms_mm": {},
+        "discrete_rms_mm": {},
     }
 
 
@@ -176,6 +206,8 @@ def write_full_case_short_run_report(
     abs_tolerance: float = DEFAULT_ABS_TOLERANCE,
     rel_tolerance: float = DEFAULT_REL_TOLERANCE,
     rail_layout: RailLayout = "interval",
+    track_irregularity: TrackIrregularityModel = "none",
+    irregularity_seed: int = 20260716,
 ) -> tuple[Path, Path]:
     """Write a Python snapshot and Markdown error report for a short full-case run."""
 
@@ -198,6 +230,8 @@ def write_full_case_short_run_report(
         resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_writer,
         rail_layout=rail_layout,
+        track_irregularity=track_irregularity,
+        irregularity_seed=irregularity_seed,
     )
     snapshot_path = output_path / "python_snapshot.json"
     snapshot_path.write_text(_json_dumps(python_snapshot), encoding="utf-8")
@@ -215,7 +249,13 @@ def write_full_case_short_run_report(
     report_path = output_path / "report.md"
     report_path.write_text(markdown, encoding="utf-8")
     if progress_writer is not None and (plot_progress or save_progress):
-        progress_writer.write_outputs(output_path / "progress")
+        progress_output = output_path / "progress"
+        progress_writer.write_outputs(progress_output)
+        irregularity_profile = build_track_irregularity_profile(
+            TrackIrregularitySettings(model=track_irregularity, seed=irregularity_seed)
+        )
+        if irregularity_profile is not None:
+            export_track_irregularity(irregularity_profile, progress_output)
     write_timing_summary(python_snapshot, output_path / "timing")
     return snapshot_path, report_path
 
@@ -227,6 +267,8 @@ def build_full_case_short_run_report(
     abs_tolerance: float = DEFAULT_ABS_TOLERANCE,
     rel_tolerance: float = DEFAULT_REL_TOLERANCE,
 ) -> str:
+    irregularity = python_snapshot.get("settings", {}).get("track_irregularity", {})
+    rms = irregularity.get("theoretical_rms_mm", {})
     lines = [
         "# SDITT Full-Case Short-Run Validation",
         "",
@@ -236,6 +278,13 @@ def build_full_case_short_run_report(
         f"- n_track: `{python_snapshot['preparation']['n_track']}`",
         f"- rail_profile_layout: `{python_snapshot['preparation'].get('rail_profile_layout', 'turnout')}`",
         f"- dynamic_track_model: `{python_snapshot['preparation'].get('dynamic_track_model', 'turnout_ft_modal')}`",
+        f"- track_irregularity: `{python_snapshot['settings'].get('track_irregularity', {}).get('model', 'none')}`",
+        f"- irregularity_seed: `{python_snapshot['settings'].get('track_irregularity', {}).get('seed', 20260716)}`",
+        f"- irregularity_wavelength_m: `{irregularity.get('min_wavelength_m', 2.0)}–{irregularity.get('max_wavelength_m', 200.0)}`",
+        f"- irregularity_spatial_frequency_step: `{irregularity.get('spatial_frequency_step_1_per_m', 0.001)} 1/m`",
+        "- irregularity_theoretical_rms_mm: `"
+        + ", ".join(f"{name}={float(value):.6g}" for name, value in rms.items())
+        + "`",
         f"- cut_freq: `{python_snapshot['settings']['cut_freq']}`",
         f"- dt: `{python_snapshot['settings']['dt']}`",
         f"- n_steps_per_stage: `{python_snapshot['settings']['n_steps_per_stage']}`",
@@ -261,14 +310,15 @@ def build_full_case_short_run_report(
         )
 
     rail_layout = python_snapshot.get("preparation", {}).get("rail_profile_layout", "turnout")
-    if rail_layout != "turnout":
+    irregularity_model = python_snapshot.get("settings", {}).get("track_irregularity", {}).get("model", "none")
+    if rail_layout != "turnout" or irregularity_model != "none":
         lines.extend(
             [
                 "",
                 "## MATLAB Comparison",
                 "",
-                "Skipped: interval basic-rail contact geometry uses the turnout FT-modal dynamic model as a surrogate, "
-                "so it is not directly comparable with the existing MATLAB turnout baseline.",
+                "Skipped: the selected rail layout or track-irregularity excitation is not directly comparable "
+                "with the existing no-irregularity MATLAB turnout baseline.",
             ]
         )
         return "\n".join(lines) + "\n"
@@ -501,6 +551,9 @@ def _contact_diagnostics(con_ws: Any) -> dict[str, Any]:
         if not isinstance(value.get("Normal_Force"), dict):
             continue
         diagnostics[wheelset] = {}
+        diagnostics[wheelset]["track_irregularity"] = _nested_array_payload(
+            value.get("Track_Irregularity", {})
+        )
         for side in ("L", "R"):
             diagnostics[wheelset][side] = {
                 "normal_force": _array_payload(value.get("Normal_Force", {}).get(side, [])),
@@ -1889,6 +1942,8 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 abs_tolerance=args.abs_tol,
                 rel_tolerance=args.rel_tol,
                 rail_layout=args.rail_layout,
+                track_irregularity=args.track_irregularity,
+                irregularity_seed=args.irregularity_seed,
             )
         except Exception as exc:  # pragma: no cover - exercised manually with GUI failures.
             state["error"] = f"{type(exc).__name__}: {exc}"
@@ -1964,6 +2019,10 @@ def _checkpoint_settings_for_args(args: argparse.Namespace, *, cut_freq: float |
         history_retention_steps=args.history_retention_steps,
         checkpoint_dir=args.checkpoint_dir,
         resume_checkpoint=False,
+        track_irregularity=TrackIrregularitySettings(
+            model=args.track_irregularity,
+            seed=args.irregularity_seed,
+        ),
     )
 
 
@@ -1989,6 +2048,18 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         choices=("interval", "turnout"),
         default="interval",
         help="Use two constant basic rails (interval, default) or the original R1+R2+R3 turnout contact layout.",
+    )
+    parser.add_argument(
+        "--track-irregularity",
+        choices=("none", "china-ballastless"),
+        default="none",
+        help="Enable the Chinese high-speed ballastless-track spectrum reconstructed by a trigonometric series.",
+    )
+    parser.add_argument(
+        "--irregularity-seed",
+        type=int,
+        default=20260716,
+        help="Random-phase seed used by the track-irregularity reconstruction.",
     )
     parser.add_argument("--dt", type=float, default=1.0e-4)
     parser.add_argument("--steps", type=int, default=1)
@@ -2077,6 +2148,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         abs_tolerance=args.abs_tol,
         rel_tolerance=args.rel_tol,
         rail_layout=args.rail_layout,
+        track_irregularity=args.track_irregularity,
+        irregularity_seed=args.irregularity_seed,
     )
     print(f"wrote {snapshot_path}")
     print(f"wrote {report_path}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from sditt.simulation import FullCaseProgressEvent
 from sditt.validation.full_case_short_run import (
@@ -209,12 +210,45 @@ def test_full_case_short_run_validation_defaults_to_not_saving_checkpoints() -> 
     assert args.resume_checkpoint is None
     assert args.checkpoint_path is None
     assert args.rail_layout == "interval"
+    assert args.track_irregularity == "none"
+    assert args.irregularity_seed == 20260716
 
 
 def test_full_case_short_run_validation_parses_turnout_layout() -> None:
-    args = _parse_args(["--rail-layout", "turnout"])
+    args = _parse_args(
+        [
+            "--rail-layout",
+            "turnout",
+            "--track-irregularity",
+            "china-ballastless",
+            "--irregularity-seed",
+            "99",
+        ]
+    )
 
     assert args.rail_layout == "turnout"
+    assert args.track_irregularity == "china-ballastless"
+    assert args.irregularity_seed == 99
+
+
+def test_full_case_short_run_writes_track_irregularity_outputs(tmp_path) -> None:
+    snapshot_path, report_path = write_full_case_short_run_report(
+        tmp_path,
+        cut_freq=50.0,
+        n_steps_per_stage=1,
+        save_progress=True,
+        track_irregularity="china-ballastless",
+        irregularity_seed=44,
+    )
+
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["settings"]["track_irregularity"]["model"] == "china-ballastless"
+    assert snapshot["settings"]["track_irregularity"]["seed"] == 44
+    assert snapshot["settings"]["track_irregularity"]["theoretical_rms_mm"]["vertical"] == pytest.approx(1.2203026)
+    assert (tmp_path / "progress" / "track_irregularity.csv").exists()
+    assert (tmp_path / "progress" / "track_irregularity_spectrum.csv").exists()
+    assert (tmp_path / "progress" / "track_irregularity.svg").exists()
+    assert "not directly comparable" in report_path.read_text(encoding="utf-8")
 
 
 def test_format_elapsed_time_uses_stable_clock_format() -> None:

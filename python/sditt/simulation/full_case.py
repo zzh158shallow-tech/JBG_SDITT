@@ -31,8 +31,11 @@ from sditt.track import (
     ModalBeamShapeFunctionContext,
     ModalFTGravityPreload,
     ModalTrackMatrices,
+    TrackIrregularityProfile,
+    TrackIrregularitySettings,
     build_default_07009_face_modal_beam_shape_function_context,
     build_modal_ft_gravity_preload,
+    build_track_irregularity_profile,
     rail_dyn_modal_ft,
     wr_force_modal_ft,
 )
@@ -139,6 +142,7 @@ class FullDefaultCaseSettings:
     resume_checkpoint: bool = False
     resume_checkpoint_path: str | Path | None = None
     checkpoint_interval_m: float | None = 10.0
+    track_irregularity: TrackIrregularitySettings = TrackIrregularitySettings()
     iteration_settings: CoupledIterationSettings = CoupledIterationSettings(
         max_iterations=11,
         force_tolerance=2.5e-3,
@@ -174,6 +178,7 @@ class FullDefaultCasePreparation:
     wheel_profiles: WheelProfileSet
     shape_function_context: ModalBeamShapeFunctionContext
     track_contact_parameters: DefaultTrackContactParameters
+    track_irregularity_profile: TrackIrregularityProfile | None
     stage_inp_par: dict[SimulationStage, dict[str, object]]
     missing_stages: tuple[MissingFullCaseStage, ...]
 
@@ -388,8 +393,8 @@ class MissingFullCasePhysicsError(RuntimeError):
     """Raised when a strict full-case run is requested before migration is complete."""
 
 
-_PRELOAD_CACHE_VERSION = 1
-_RUN_CHECKPOINT_VERSION = 1
+_PRELOAD_CACHE_VERSION = 2
+_RUN_CHECKPOINT_VERSION = 2
 
 
 def _preload_cache_path(preparation: FullDefaultCasePreparation) -> Path | None:
@@ -450,6 +455,7 @@ def _preload_cache_fingerprint(preparation: FullDefaultCasePreparation) -> dict[
             "stage_end_mileage": {str(key): value for key, value in (settings.stage_end_mileage or {}).items()},
             "use_matlab_mileage_endpoints": settings.use_matlab_mileage_endpoints,
             "use_sparse": settings.use_sparse,
+            "track_irregularity": asdict(settings.track_irregularity),
             "iteration_settings": asdict(settings.iteration_settings),
         },
         "input_files": {
@@ -759,6 +765,7 @@ def prepare_default_full_case(
     )
     shared_inp_par = operating_case.to_inp_par()
     shared_inp_par.update(shape_function_context.inp_par_fields())
+    track_irregularity_profile = build_track_irregularity_profile(settings.track_irregularity)
 
     return FullDefaultCasePreparation(
         paths=paths,
@@ -773,6 +780,7 @@ def prepare_default_full_case(
         wheel_profiles=wheel_profiles,
         shape_function_context=shape_function_context,
         track_contact_parameters=_default_contact_track_parameters(),
+        track_irregularity_profile=track_irregularity_profile,
         stage_inp_par={
             stage: {
                 **shared_inp_par,
@@ -1537,6 +1545,7 @@ def _diagnostic_callbacks(
                 fixed_d0_by_wheelset=step_input_state.d0_by_wheelset or None,
                 previous_relvel_max_by_wheelset=previous_relvel_max_by_wheelset,
                 use_cal_d0_trace=preparation.total_dof > 1000,
+                track_irregularity=preparation.track_irregularity_profile,
             )
             prior_pjc = previous_iteration_pjc.get(state.step_index)
             if prior_pjc is None and step_input_state.pjc is not None:
@@ -1867,6 +1876,7 @@ def _initial_unloaded_d0_by_wheelset(preparation: FullDefaultCasePreparation) ->
         zero_state,
         front_mileage=front_mileage,
         track_parameters=preparation.track_contact_parameters,
+        track_irregularity=preparation.track_irregularity_profile,
     )
     return {wheelset: float(value) for wheelset, value in contact.d0_by_wheelset.items()}
 
