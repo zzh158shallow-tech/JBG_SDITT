@@ -17,8 +17,8 @@ Use this section when Codex or a developer is setting up the project on a new
 computer from GitHub.
 
 1. Clone the private repository:
-   - `git clone git@github.com:zzh158shallow-tech/SDITT_PY.git SDITT`
-   - `cd SDITT`
+   - `git clone https://github.com/zzh158shallow-tech/JBG_SDITT.git JBG_SDITT`
+   - `cd JBG_SDITT`
 2. Configure the GitHub SSH key if the machine uses the project key:
    - `git config core.sshCommand "ssh -i ~/.ssh/id_ed25519_github -o IdentitiesOnly=yes"`
 3. Create and activate a Python virtual environment:
@@ -128,7 +128,7 @@ Generated outputs are intentionally ignored under `python/outputs/` and
 
 - This project is a private GitHub repository.
 - Default remote: `origin`
-- Remote URL: `git@github.com:zzh158shallow-tech/SDITT_PY.git`
+- Remote URL: `https://github.com/zzh158shallow-tech/JBG_SDITT.git`
 - Default branch: `main`
 - Use the local SSH key at `~/.ssh/id_ed25519_github` for GitHub access.
 - The repo is configured with:
