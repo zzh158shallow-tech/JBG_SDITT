@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from scipy import sparse
 
-from sditt.config import MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths
+from sditt.config import DEFAULT_OPERATING_CASE, DefaultOperatingCase, ProjectPaths
 from sditt.track import ModalTrackMatrices, build_flexible_turnout_modal_matrices
 from sditt.vehicle import VehicleMatrices, build_vehicle_matrices_rw_230409, load_vehicle_parameters
 
@@ -220,7 +220,7 @@ def build_default_modal_rw_system_matrices(
     repo_root: str | Path | None = None,
     cut_freq: float | None = None,
     vlc: float | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> tuple[SystemMatrices, ModalTrackMatrices, VehicleMatrices]:
     """Build the MATLAB full default route: 07(009), Face, 350 km/h, FT-Modal."""
 
@@ -254,7 +254,7 @@ def build_default_sparse_modal_rw_system_matrices(
     repo_root: str | Path | None = None,
     cut_freq: float | None = None,
     vlc: float | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> tuple[SparseSystemMatrices, ModalTrackMatrices, VehicleMatrices]:
     """Build the MATLAB full default route using sparse block matrices."""
 

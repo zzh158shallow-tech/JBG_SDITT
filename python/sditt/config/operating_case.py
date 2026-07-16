@@ -7,6 +7,7 @@ from typing import Literal
 VehicleDirection = Literal["Face", "Trail"]
 TrackType = Literal["FT-Modal", "FT-FEM", "Co-Running", "Flexible Track"]
 LayoutType = Literal["Straight", "Curve"]
+RailLayout = Literal["interval", "turnout"]
 NormalContactType = Literal["Hertz", "Hertz&ConDamp", "SIMHertz&ConDamp", "STRIPES&ConDamp"]
 ContactDampingType = Literal["Hu-Guo", "Ref", "Lankarani-CNikravesh"]
 IntegrationMethod = Literal["Park", "Newmark", "Zhai_Predict", "Houbolt"]
@@ -15,8 +16,9 @@ SimulationStage = Literal["Preload", "Cal"]
 
 @dataclass(frozen=True)
 class DefaultOperatingCase:
-    """MATLAB main-script defaults for the 07(009) Face FT-Modal route."""
+    """Default 07(009) Face FT-Modal route with selectable contact layout."""
 
+    rail_layout: RailLayout = "interval"
     choose_turnout: str = "07(009)"
     track_type: TrackType = "FT-Modal"
     layout_type: LayoutType = "Straight"
@@ -32,14 +34,8 @@ class DefaultOperatingCase:
     nm_fw: int = 0
     n_rigid_vehicle_base: int = 35
     n_rigid_vehicle_extra: int = 16
-    contact_patch_left: int = 1
-    contact_patch_right: int = 3
     type_side: tuple[str, ...] = ("L", "R")
     wheelsets: tuple[str, ...] = ("FF", "FR", "RF", "RR")
-    dummy_rails: tuple[str, ...] = ("L1", "R1", "R2", "R3")
-    dummy_rails_left: tuple[str, ...] = ("L1",)
-    dummy_rails_right: tuple[str, ...] = ("R1", "R2", "R3")
-    dummy_rail_wheel_side: tuple[str, ...] = ("L", "R", "R", "R")
     dof_types: tuple[str, ...] = ("UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ")
     rail_types_all: tuple[str, ...] = (
         "zjbg",
@@ -51,7 +47,6 @@ class DefaultOperatingCase:
         "cgjg",
         "hg",
     )
-    rail_types: tuple[str, ...] = ("zjbg", "qjbg", "zjg_zgyg", "cxg")
     baseplate_types: tuple[str, ...] = (
         "Switch_L",
         "Switch_R",
@@ -68,6 +63,38 @@ class DefaultOperatingCase:
         "Plain_Div_R",
     )
     simulation_stages: tuple[SimulationStage, ...] = ("Preload", "Cal")
+
+    def __post_init__(self) -> None:
+        if self.rail_layout not in ("interval", "turnout"):
+            raise ValueError(f"unsupported rail_layout {self.rail_layout!r}")
+
+    @property
+    def contact_patch_left(self) -> int:
+        return 1
+
+    @property
+    def contact_patch_right(self) -> int:
+        return 1 if self.rail_layout == "interval" else 3
+
+    @property
+    def dummy_rails(self) -> tuple[str, ...]:
+        return ("L1", "R1") if self.rail_layout == "interval" else ("L1", "R1", "R2", "R3")
+
+    @property
+    def dummy_rails_left(self) -> tuple[str, ...]:
+        return ("L1",)
+
+    @property
+    def dummy_rails_right(self) -> tuple[str, ...]:
+        return ("R1",) if self.rail_layout == "interval" else ("R1", "R2", "R3")
+
+    @property
+    def dummy_rail_wheel_side(self) -> tuple[str, ...]:
+        return ("L", "R") if self.rail_layout == "interval" else ("L", "R", "R", "R")
+
+    @property
+    def rail_types(self) -> tuple[str, ...]:
+        return ("zjbg", "qjbg") if self.rail_layout == "interval" else ("zjbg", "qjbg", "zjg_zgyg", "cxg")
 
     @property
     def vlc(self) -> float:
@@ -100,6 +127,7 @@ class DefaultOperatingCase:
 
         return {
             "Choose_Turnout": self.choose_turnout,
+            "Rail_Profile_Layout": self.rail_layout,
             "Type_Side": self.type_side,
             "Exp_WS": self.wheelsets,
             "Exp_DummyRail": self.dummy_rails,
@@ -129,4 +157,5 @@ class DefaultOperatingCase:
         }
 
 
-MATLAB_FULL_DEFAULT_CASE = DefaultOperatingCase()
+DEFAULT_OPERATING_CASE = DefaultOperatingCase()
+MATLAB_FULL_DEFAULT_CASE = DefaultOperatingCase(rail_layout="turnout")

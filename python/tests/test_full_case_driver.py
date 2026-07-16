@@ -22,7 +22,12 @@ from sditt.simulation import (
     prepare_default_full_case,
     run_default_full_case_driver,
 )
-from sditt.simulation.full_case import _matlab_mileage_step_dt, _stage_step_count
+from sditt.simulation.full_case import (
+    _matlab_mileage_step_dt,
+    _preload_cache_key,
+    _run_checkpoint_key,
+    _stage_step_count,
+)
 from sditt.track import rail_dyn_modal_ft, wr_force_modal_ft
 from sditt.vehicle import build_nonlinear_damper_response, wr_force_vehicle_sys_rotation_iii
 
@@ -102,7 +107,11 @@ def test_prepare_default_full_case_builds_low_cutoff_system_and_reports_gaps() -
     assert preparation.gravity_preload.pxt_gravity[25] == pytest.approx(9.81 * 2280.0)
     assert preparation.gravity_preload.pxt_gravity[35] == pytest.approx(9.81 * 40840.0)
     assert preparation.gravity_preload.pxt_gravity[:5].any()
-    assert preparation.profile_selector.select(54.0)["R1"].by_station["FF"].profile_num == 22
+    assert preparation.operating_case.rail_layout == "interval"
+    assert preparation.operating_case.n_contact_patch == 2
+    assert preparation.stage_inp_par["Cal"]["Exp_DummyRail"] == ("L1", "R1")
+    assert preparation.stage_inp_par["Cal"]["Type_Rail"] == ("zjbg", "qjbg")
+    assert preparation.profile_selector.select(54.0)["R1"].by_station["FF"].profile_num == 1
     assert preparation.shape_function_context.n_track == 5
     assert preparation.stage_inp_par["Cal"]["N_track"] == 5
     assert preparation.stage_inp_par["Cal"]["ModeShape"]["qjbg"].shape == (4084, 5)
@@ -112,6 +121,30 @@ def test_prepare_default_full_case_builds_low_cutoff_system_and_reports_gaps() -
     assert "beam_shape_function" not in {stage.name for stage in preparation.missing_stages}
     assert "nonlinear_vehicle_dampers" not in {stage.name for stage in preparation.missing_stages}
     assert "curve_external_force" not in {stage.name for stage in preparation.missing_stages}
+
+
+def test_prepare_turnout_full_case_preserves_original_four_rail_contact_layout() -> None:
+    preparation = prepare_default_full_case(
+        settings=FullDefaultCaseSettings(cut_freq=50.0),
+        operating_case=DefaultOperatingCase(rail_layout="turnout"),
+    )
+
+    assert preparation.operating_case.n_contact_patch == 4
+    assert preparation.stage_inp_par["Cal"]["Exp_DummyRail"] == ("L1", "R1", "R2", "R3")
+    assert preparation.profile_selector.select(54.0)["R1"].by_station["FF"].profile_num == 22
+    assert "R2_zjg" in preparation.shape_function_context.rail_beam.pos_z
+
+
+def test_interval_and_turnout_use_distinct_cache_and_checkpoint_fingerprints() -> None:
+    settings = FullDefaultCaseSettings(cut_freq=50.0, preload_cache_dir="cache", checkpoint_dir="checkpoints")
+    interval = prepare_default_full_case(settings=settings)
+    turnout = prepare_default_full_case(
+        settings=settings,
+        operating_case=DefaultOperatingCase(rail_layout="turnout"),
+    )
+
+    assert _preload_cache_key(interval) != _preload_cache_key(turnout)
+    assert _run_checkpoint_key(interval) != _run_checkpoint_key(turnout)
 
 
 def test_run_default_full_case_driver_converges_with_default_full_size_settings() -> None:
@@ -182,11 +215,11 @@ def test_full_case_driver_carries_contact_state_from_preload_to_cal() -> None:
     assert preload_state.prhx is not None
     assert preload_state.prhxf is not None
     assert preload_state.con_ws is not None
-    assert preload_state.pjc.shape == (16, 2)
-    assert preload_state.pjch.shape == (16, 1)
-    assert preload_state.pjcc.shape == (16, 1)
-    assert preload_state.prhx.shape == (16, 3)
-    assert preload_state.prhxf.shape == (16, 6)
+    assert preload_state.pjc.shape == (8, 2)
+    assert preload_state.pjch.shape == (8, 1)
+    assert preload_state.pjcc.shape == (8, 1)
+    assert preload_state.prhx.shape == (8, 3)
+    assert preload_state.prhxf.shape == (8, 6)
     assert set(preload_state.con_ws) >= set(result.preparation.operating_case.wheelsets)
     assert set(preload_state.relvel_max_by_wheelset) == set(result.preparation.operating_case.wheelsets)
     assert set(cal_step_one_records[0].contact_state.relvel_max_by_wheelset) == set(
@@ -196,11 +229,13 @@ def test_full_case_driver_carries_contact_state_from_preload_to_cal() -> None:
 
 
 def test_run_default_full_case_driver_executes_preload_then_cal_in_diagnostic_mode() -> None:
+    progress_events = []
     result = run_default_full_case_driver(
         settings=FullDefaultCaseSettings(
             cut_freq=50.0,
             dt=1.0e-4,
             n_steps_per_stage=2,
+            progress_callback=progress_events.append,
         )
     )
 
@@ -232,9 +267,9 @@ def test_run_default_full_case_driver_executes_preload_then_cal_in_diagnostic_mo
     assert cal.history.rail_response[-1].stage == "Cal"
     assert cal.history.rail_response[-1].physical_rail_recovered
     assert cal.history.rail_response[-1].shape_function["FF_qjbg_Y"].size == 4
-    assert cal.history.rail_response[-1].dis_rail.shape == (16, 6)
-    assert cal.history.rail_response[-1].vel_rail.shape == (16, 6)
-    assert cal.history.rail_response[-1].acc_rail.shape == (16, 6)
+    assert cal.history.rail_response[-1].dis_rail.shape == (8, 6)
+    assert cal.history.rail_response[-1].vel_rail.shape == (8, 6)
+    assert cal.history.rail_response[-1].acc_rail.shape == (8, 6)
     assert "qjbg_Dis" in cal.history.rail_response[-1].dyn_status_rail
     assert cal.history.rail_response[-1].missing_reason is None
     assert cal.history.contact_geometry[-1].contact_force_enabled
@@ -248,11 +283,21 @@ def test_run_default_full_case_driver_executes_preload_then_cal_in_diagnostic_mo
     assert cal.output_rows[-1].front_mileage == pytest.approx(cal.history.rail_response[-1].front_mileage)
     assert cal.output_rows[-1].vehicle_displacement.shape == (51,)
     assert cal.output_rows[-1].contact_state is not None
-    assert cal.output_rows[-1].pjcc.shape == (16, 1)
-    assert cal.output_rows[-1].prhxf.shape == (16, 6)
-    assert cal.output_rows[-1].patch_force_z.shape == (16,)
+    assert cal.output_rows[-1].pjcc.shape == (8, 1)
+    assert cal.output_rows[-1].prhxf.shape == (8, 6)
+    assert cal.output_rows[-1].patch_force_z.shape == (8,)
     assert cal.output_rows[-1].wheelset_vertical_force.shape == (4, 2)
     assert cal.output_rows[-1].wheelset_lateral_force.shape == (4, 2)
+    assert progress_events[-1].patch_force_labels == (
+        "FF-L1",
+        "FF-R1",
+        "FR-L1",
+        "FR-R1",
+        "RF-L1",
+        "RF-R1",
+        "RR-L1",
+        "RR-R1",
+    )
 
     expected_shape_function, _ = result.preparation.shape_function_context.evaluate(cal.history.rail_response[-1].front_mileage)
     expected_dis_rail, expected_vel_rail, expected_acc_rail, expected_dyn_status = rail_dyn_modal_ft(
@@ -274,8 +319,16 @@ def test_run_default_full_case_driver_executes_preload_then_cal_in_diagnostic_mo
     ff_track_profile = wheel_rail_contact.track_profiles["FF"]
     assert ff_track_profile.offsets["L1"][0] == pytest.approx(cal.history.rail_response[-1].dis_rail[0, 1])
     assert ff_track_profile.offsets["L1"][1] == pytest.approx(0.6 + cal.history.rail_response[-1].dis_rail[0, 2])
-    assert ff_track_profile.offsets["R2"][0] == pytest.approx(cal.history.rail_response[-1].dis_rail[2, 1])
-    assert ff_track_profile.offsets["R2"][1] == pytest.approx(0.6 + cal.history.rail_response[-1].dis_rail[2, 2])
+    assert ff_track_profile.offsets["R1"][0] == pytest.approx(cal.history.rail_response[-1].dis_rail[1, 1])
+    assert ff_track_profile.offsets["R1"][1] == pytest.approx(0.6 + cal.history.rail_response[-1].dis_rail[1, 2])
+    assert "R2" not in ff_track_profile.offsets
+    assert "R3" not in ff_track_profile.offsets
+    assert cal.history.rail_response[-1].rail_beam_motion["Pos_Z"] == {}
+    assert cal.history.rail_response[-1].rail_beam_motion["Vel_Z"] == {}
+    for wheelset in result.preparation.operating_case.wheelsets:
+        right_normal_force = np.asarray(wheel_rail_contact.con_ws[wheelset]["Normal_Force"]["R"], dtype=float)
+        if right_normal_force.size:
+            assert np.all(right_normal_force[:, 3] == 2)
     vjd_blocks = [
         np.asarray(wheel_rail_contact.con_ws[wheelset]["Vjd"][side], dtype=float)
         for wheelset in result.preparation.operating_case.wheelsets
@@ -504,7 +557,8 @@ def test_run_default_full_case_driver_maps_frozen_contact_force_into_track_and_v
             dt=1.0e-4,
             n_steps_per_stage=1,
             frozen_contact_input=frozen_input,
-        )
+        ),
+        operating_case=DefaultOperatingCase(rail_layout="turnout"),
     )
 
     cal = result.stages[1]
@@ -578,7 +632,10 @@ def test_run_default_full_case_driver_strict_mode_still_rejects_curve_route() ->
 
 
 def test_matlab_mileage_step_dt_matches_crossing_small_step_windows() -> None:
-    preparation = prepare_default_full_case(settings=FullDefaultCaseSettings(cut_freq=50.0))
+    preparation = prepare_default_full_case(
+        settings=FullDefaultCaseSettings(cut_freq=50.0),
+        operating_case=DefaultOperatingCase(rail_layout="turnout"),
+    )
 
     assert _matlab_mileage_step_dt(preparation, 59.9, 1.0e-4) == pytest.approx(1.0e-4)
     assert _matlab_mileage_step_dt(preparation, 60.0, 1.0e-4) == pytest.approx(5.0e-5)
@@ -592,7 +649,8 @@ def test_stage_step_count_accounts_for_matlab_mileage_small_steps() -> None:
             cut_freq=50.0,
             dt=1.0e-4,
             stage_end_mileage={"Cal": 104.01},
-        )
+        ),
+        operating_case=DefaultOperatingCase(rail_layout="turnout"),
     )
 
     steps = _stage_step_count(preparation, "Cal", 103.99)
@@ -610,7 +668,8 @@ def test_iteration_output_summary_matches_matlab_baseline() -> None:
             cut_freq=50.0,
             dt=1.0e-4,
             n_steps_per_stage=2,
-        )
+        ),
+        operating_case=DefaultOperatingCase(rail_layout="turnout"),
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:

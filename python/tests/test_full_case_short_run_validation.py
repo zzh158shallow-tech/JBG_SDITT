@@ -32,14 +32,22 @@ def test_full_case_short_run_validation_writes_python_snapshot_and_report(tmp_pa
 
     assert snapshot["schema"] == "sditt-full-case-short-run-v1"
     assert snapshot["source"] == "python"
+    assert snapshot["settings"]["rail_layout"] == "interval"
+    assert snapshot["preparation"]["rail_profile_layout"] == "interval"
+    assert snapshot["preparation"]["dynamic_track_model"] == "turnout_ft_modal_surrogate"
     assert [stage["name"] for stage in snapshot["stages"]] == ["Preload", "Cal"]
     assert snapshot["stages"][0]["output_rows"][0]["pjcc"]
     assert "SDITT Full-Case Short-Run Validation" in report
-    assert "No MATLAB baseline was supplied" in report
+    assert "not directly comparable" in report
 
 
 def test_full_case_short_run_validation_compares_matching_snapshots() -> None:
-    snapshot = build_python_short_run_snapshot(cut_freq=50.0, dt=1.0e-4, n_steps_per_stage=1)
+    snapshot = build_python_short_run_snapshot(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        n_steps_per_stage=1,
+        rail_layout="turnout",
+    )
 
     metrics = compare_short_run_snapshots(snapshot, snapshot)
 
@@ -48,7 +56,12 @@ def test_full_case_short_run_validation_compares_matching_snapshots() -> None:
 
 
 def test_full_case_short_run_validation_accepts_single_matlab_stage_object() -> None:
-    snapshot = build_python_short_run_snapshot(cut_freq=50.0, dt=1.0e-4, n_steps_per_stage=1)
+    snapshot = build_python_short_run_snapshot(
+        cut_freq=50.0,
+        dt=1.0e-4,
+        n_steps_per_stage=1,
+        rail_layout="turnout",
+    )
     single_stage = {
         **snapshot["stages"][0],
         "output_rows": snapshot["stages"][0]["output_rows"][0],
@@ -195,6 +208,13 @@ def test_full_case_short_run_validation_defaults_to_not_saving_checkpoints() -> 
     assert not args.save_checkpoints
     assert args.resume_checkpoint is None
     assert args.checkpoint_path is None
+    assert args.rail_layout == "interval"
+
+
+def test_full_case_short_run_validation_parses_turnout_layout() -> None:
+    args = _parse_args(["--rail-layout", "turnout"])
+
+    assert args.rail_layout == "turnout"
 
 
 def test_format_elapsed_time_uses_stable_clock_format() -> None:

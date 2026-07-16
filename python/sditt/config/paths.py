@@ -46,3 +46,9 @@ class ProjectPaths:
     @property
     def turnout_mileage_dir(self) -> Path:
         return self.profile_dir / "07(009)-Mileage"
+
+    @property
+    def standard_basic_rail_profile(self) -> Path:
+        """Measured standard stock-rail section reused by interval contact mode."""
+
+        return self.profile_dir / "07(009)-zjg-20200418" / "jbg-20200418-R.txt"

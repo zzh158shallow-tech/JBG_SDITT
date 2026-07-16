@@ -3,11 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Protocol
 
 import numpy as np
 
-from sditt.config import MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths
+from sditt.config import DEFAULT_OPERATING_CASE, MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths
 from sditt.vehicle import VehicleParameters
 
 from .geometry import (
@@ -25,6 +25,51 @@ from .loaders import load_profile_file
 
 
 DummyRailProfiles = dict[str, RailProfileSet]
+
+
+class RailProfileSelector(Protocol):
+    """Common interface for mileage-varying turnout and constant interval profiles."""
+
+    def select(self, j1: float, profile_num_interp: Iterable[str] | None = None) -> DummyRailProfiles: ...
+
+
+@dataclass(frozen=True)
+class ConstantBasicRailProfileSelector:
+    """Return one measured standard basic-rail section on both track sides."""
+
+    profile_file: Path
+    rail_names: tuple[str, ...] = ("L1", "R1")
+
+    @cached_property
+    def record(self) -> RailProfileRecord:
+        profile = sort_points(load_profile_file(self.profile_file).points[:, :2])
+        return RailProfileRecord(
+            profile_num=1,
+            profile=profile,
+            front_profile=profile,
+            rear_profile=profile,
+            front_extreme=extreme_points(profile),
+            rear_extreme=extreme_points(profile),
+            radius=rail_curvature_radius(profile),
+        )
+
+    @cached_property
+    def profile_set(self) -> RailProfileSet:
+        return RailProfileSet(by_station={station: self.record for station in ("FF", "FR", "RF", "RR")})
+
+    def select(
+        self,
+        j1: float,
+        profile_num_interp: Iterable[str] | None = None,
+    ) -> DummyRailProfiles:
+        """Return the same L1/R1 basic-rail profile regardless of mileage."""
+
+        del j1
+        requested = self.rail_names if profile_num_interp is None else tuple(profile_num_interp)
+        unsupported = tuple(rail for rail in requested if rail not in self.rail_names)
+        if unsupported:
+            raise ValueError(f"unsupported interval dummy rail profiles: {unsupported}")
+        return {rail: self.profile_set for rail in requested}
 
 
 @dataclass(frozen=True)
@@ -45,11 +90,11 @@ class DefaultRailProfileSelector:
     def select(
         self,
         j1: float,
-        profile_num_interp: Iterable[str] = ("L1", "R1", "R2", "R3"),
+        profile_num_interp: Iterable[str] | None = None,
     ) -> DummyRailProfiles:
         """Construct MATLAB-style ``RailPro_ProCS`` records for one front mileage."""
 
-        requested = tuple(profile_num_interp)
+        requested = ("L1", "R1", "R2", "R3") if profile_num_interp is None else tuple(profile_num_interp)
         cache_key = (float(j1), requested)
         cached = self._select_cache.get(cache_key)
         if cached is not None:
@@ -183,6 +228,37 @@ def build_default_07009_face_profile_selector(
         mileage_entries=entries,
         bezier_profiles=bezier,
         distance_vehicle=_distance_vehicle(vehicle_parameters),
+        num_interp=num_interp,
+    )
+
+
+def build_interval_basic_rail_profile_selector(
+    *,
+    repo_root: str | Path | None = None,
+) -> ConstantBasicRailProfileSelector:
+    """Build the mileage-invariant two-basic-rail interval selector."""
+
+    paths = ProjectPaths.from_repo_root(repo_root)
+    if not paths.standard_basic_rail_profile.exists():
+        raise FileNotFoundError(f"standard basic rail profile was not found: {paths.standard_basic_rail_profile}")
+    return ConstantBasicRailProfileSelector(profile_file=paths.standard_basic_rail_profile)
+
+
+def build_default_rail_profile_selector(
+    *,
+    repo_root: str | Path | None = None,
+    vehicle_parameters: VehicleParameters | Mapping[str, object] | None = None,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
+    num_interp: int = 1000,
+) -> RailProfileSelector:
+    """Build the selector matching the requested interval/turnout contact layout."""
+
+    if operating_case.rail_layout == "interval":
+        return build_interval_basic_rail_profile_selector(repo_root=repo_root)
+    return build_default_07009_face_profile_selector(
+        repo_root=repo_root,
+        vehicle_parameters=vehicle_parameters,
+        operating_case=operating_case,
         num_interp=num_interp,
     )
 

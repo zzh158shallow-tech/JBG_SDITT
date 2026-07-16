@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from sditt.config import MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths
+from sditt.config import DEFAULT_OPERATING_CASE, MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths
 from sditt.io import inspect_raw_inputs, load_sditt_raw_inputs
 from sditt.io.text import load_numeric_text
 from sditt.profiles import (
     build_default_07009_face_profile_selector,
+    build_default_rail_profile_selector,
     build_track_profiles,
     build_wheel_profiles,
     contact_tables,
@@ -249,6 +250,7 @@ def test_matlab_full_default_operating_case_matches_main_script() -> None:
     assert case.cut_freq_ft == 2000.0
     assert case.n_rv == 51
     assert case.n_contact_patch == 4
+    assert case.rail_layout == "turnout"
 
     assert inp_par["Choose_Turnout"] == "07(009)"
     assert inp_par["VehicleDir"] == "Face"
@@ -264,6 +266,20 @@ def test_matlab_full_default_operating_case_matches_main_script() -> None:
     assert inp_par["Exp_DummyRail"] == ("L1", "R1", "R2", "R3")
     assert case.stage_inp_par("Preload")["Type_simulation"] == "Preload"
     assert case.stage_inp_par("Cal")["Type_simulation"] == "Cal"
+
+
+def test_default_interval_operating_case_uses_two_basic_rail_contact_slots() -> None:
+    case = DEFAULT_OPERATING_CASE
+    inp_par = case.to_inp_par()
+
+    assert case.rail_layout == "interval"
+    assert case.n_contact_patch == 2
+    assert case.dummy_rails == ("L1", "R1")
+    assert case.dummy_rails_left == ("L1",)
+    assert case.dummy_rails_right == ("R1",)
+    assert case.rail_types == ("zjbg", "qjbg")
+    assert inp_par["Rail_Profile_Layout"] == "interval"
+    assert inp_par["N_ConPatch"] == 2
 
 
 def test_default_operating_case_trail_speed_sign() -> None:
@@ -374,6 +390,21 @@ def test_default_07009_face_profile_selector_builds_matlab_style_records() -> No
     assert profiles["R1"].by_station["FF"].profile.shape == (128, 2)
     assert profiles["R2"].by_station["FF"].front_profile.shape[1] == 2
     assert profiles["R2"].by_station["FF"].radius.shape == (128, 2)
+
+
+def test_interval_profile_selector_reuses_one_constant_basic_rail_section() -> None:
+    selector = build_default_rail_profile_selector(operating_case=DEFAULT_OPERATING_CASE)
+    at_start = selector.select(32.0)
+    at_end = selector.select(140.0)
+
+    assert set(at_start) == {"L1", "R1"}
+    assert set(at_end) == {"L1", "R1"}
+    for station in ("FF", "FR", "RF", "RR"):
+        left = at_start["L1"].by_station[station]
+        right = at_start["R1"].by_station[station]
+        assert left.profile_num == 1
+        assert np.array_equal(left.profile, right.profile)
+        assert np.array_equal(left.profile, at_end["L1"].by_station[station].profile)
 
 
 def test_load_mileage_text_file() -> None:

@@ -12,6 +12,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+from sditt.config import DefaultOperatingCase, RailLayout
 from sditt.simulation import (
     FullCaseProgressEvent,
     FullCaseProfileSnapshot,
@@ -76,6 +77,7 @@ def build_python_short_run_snapshot(
     resume_checkpoint: bool = False,
     resume_checkpoint_path: str | Path | None = None,
     progress_callback: Any = None,
+    rail_layout: RailLayout = "interval",
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
 
@@ -93,7 +95,10 @@ def build_python_short_run_snapshot(
         resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_callback,
     )
-    result = run_default_full_case_driver(settings=settings)
+    result = run_default_full_case_driver(
+        settings=settings,
+        operating_case=DefaultOperatingCase(rail_layout=rail_layout),
+    )
     return snapshot_from_run_result(result)
 
 
@@ -103,6 +108,7 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
         "schema": "sditt-full-case-short-run-v1",
         "source": "python",
         "settings": {
+            "rail_layout": preparation.operating_case.rail_layout,
             "cut_freq": preparation.settings.cut_freq,
             "dt": preparation.settings.dt,
             "n_steps_per_stage": preparation.settings.n_steps_per_stage,
@@ -132,6 +138,12 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "mileage": result.resumed_checkpoint_mileage,
         },
         "preparation": {
+            "rail_profile_layout": preparation.operating_case.rail_layout,
+            "dynamic_track_model": (
+                "turnout_ft_modal_surrogate"
+                if preparation.operating_case.rail_layout == "interval"
+                else "turnout_ft_modal"
+            ),
             "total_dof": preparation.total_dof,
             "n_track": preparation.system.layout.n_track,
             "wheelsets": list(preparation.operating_case.wheelsets),
@@ -163,6 +175,7 @@ def write_full_case_short_run_report(
     matlab_baseline_path: str | Path | None = None,
     abs_tolerance: float = DEFAULT_ABS_TOLERANCE,
     rel_tolerance: float = DEFAULT_REL_TOLERANCE,
+    rail_layout: RailLayout = "interval",
 ) -> tuple[Path, Path]:
     """Write a Python snapshot and Markdown error report for a short full-case run."""
 
@@ -184,6 +197,7 @@ def write_full_case_short_run_report(
         resume_checkpoint=resume_checkpoint,
         resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_writer,
+        rail_layout=rail_layout,
     )
     snapshot_path = output_path / "python_snapshot.json"
     snapshot_path.write_text(_json_dumps(python_snapshot), encoding="utf-8")
@@ -220,6 +234,8 @@ def build_full_case_short_run_report(
         "",
         f"- total_dof: `{python_snapshot['preparation']['total_dof']}`",
         f"- n_track: `{python_snapshot['preparation']['n_track']}`",
+        f"- rail_profile_layout: `{python_snapshot['preparation'].get('rail_profile_layout', 'turnout')}`",
+        f"- dynamic_track_model: `{python_snapshot['preparation'].get('dynamic_track_model', 'turnout_ft_modal')}`",
         f"- cut_freq: `{python_snapshot['settings']['cut_freq']}`",
         f"- dt: `{python_snapshot['settings']['dt']}`",
         f"- n_steps_per_stage: `{python_snapshot['settings']['n_steps_per_stage']}`",
@@ -243,6 +259,19 @@ def build_full_case_short_run_report(
                 normal_tan=float(final.get("normal_tangential_error", 0.0)),
             )
         )
+
+    rail_layout = python_snapshot.get("preparation", {}).get("rail_profile_layout", "turnout")
+    if rail_layout != "turnout":
+        lines.extend(
+            [
+                "",
+                "## MATLAB Comparison",
+                "",
+                "Skipped: interval basic-rail contact geometry uses the turnout FT-modal dynamic model as a surrogate, "
+                "so it is not directly comparable with the existing MATLAB turnout baseline.",
+            ]
+        )
+        return "\n".join(lines) + "\n"
 
     if matlab_snapshot is None:
         lines.extend(
@@ -1859,6 +1888,7 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 matlab_baseline_path=args.matlab_baseline,
                 abs_tolerance=args.abs_tol,
                 rel_tolerance=args.rel_tol,
+                rail_layout=args.rail_layout,
             )
         except Exception as exc:  # pragma: no cover - exercised manually with GUI failures.
             state["error"] = f"{type(exc).__name__}: {exc}"
@@ -1903,7 +1933,10 @@ def _checkpoint_summaries_for_args(args: argparse.Namespace, *, cut_freq: float 
     if args.checkpoint_dir is None:
         return ()
     settings = _checkpoint_settings_for_args(args, cut_freq=cut_freq)
-    return list_default_full_case_checkpoints(settings=settings)
+    return list_default_full_case_checkpoints(
+        settings=settings,
+        operating_case=DefaultOperatingCase(rail_layout=args.rail_layout),
+    )
 
 
 def _checkpoint_summary_for_path(
@@ -1913,7 +1946,11 @@ def _checkpoint_summary_for_path(
     cut_freq: float | None,
 ) -> dict[str, Any] | None:
     settings = _checkpoint_settings_for_args(args, cut_freq=cut_freq)
-    return load_default_full_case_checkpoint_summary(checkpoint_path, settings=settings)
+    return load_default_full_case_checkpoint_summary(
+        checkpoint_path,
+        settings=settings,
+        operating_case=DefaultOperatingCase(rail_layout=args.rail_layout),
+    )
 
 
 def _checkpoint_settings_for_args(args: argparse.Namespace, *, cut_freq: float | None) -> FullDefaultCaseSettings:
@@ -1947,6 +1984,12 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run and compare a short SDITT full-case validation.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--matlab-baseline", type=Path, default=None)
+    parser.add_argument(
+        "--rail-layout",
+        choices=("interval", "turnout"),
+        default="interval",
+        help="Use two constant basic rails (interval, default) or the original R1+R2+R3 turnout contact layout.",
+    )
     parser.add_argument("--dt", type=float, default=1.0e-4)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument(
@@ -2033,6 +2076,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         matlab_baseline_path=args.matlab_baseline,
         abs_tolerance=args.abs_tol,
         rel_tolerance=args.rel_tol,
+        rail_layout=args.rail_layout,
     )
     print(f"wrote {snapshot_path}")
     print(f"wrote {report_path}")

@@ -53,19 +53,18 @@ This reads/summarizes `Mat_FT_S8b.mat`, loads `ModeFreq.FT_All`, parses
 numeric text tables such as damping-ratio and mileage files. It is intentionally
 only a data layer.
 
-MATLAB full default operating case:
+Operating-case layouts:
 
 ```python
-from sditt.config import MATLAB_FULL_DEFAULT_CASE
+from sditt.config import DEFAULT_OPERATING_CASE, MATLAB_FULL_DEFAULT_CASE
 
-case = MATLAB_FULL_DEFAULT_CASE
-inp_par = case.to_inp_par()
+interval_inp_par = DEFAULT_OPERATING_CASE.to_inp_par()
+turnout_inp_par = MATLAB_FULL_DEFAULT_CASE.to_inp_par()
 ```
 
-This aligns the Python defaults with `SDITT_CR400_NoStrTIrr_250728_Face.m`:
-`07(009)`, `Face`, `350 km/h`, `FT-Modal`, `STRIPES&ConDamp`, Hu-Guo contact
-damping coefficient `0.83`, Park integration, `CRH380A_v6`, `NM_FW = 0`,
-`Type_Layout = Straight`, and the MATLAB two-stage loop `Preload` then `Cal`.
+`DEFAULT_OPERATING_CASE` uses two constant basic-rail contact slots, `L1/R1`.
+`MATLAB_FULL_DEFAULT_CASE` preserves the original turnout `L1/R1/R2/R3`
+contact layout aligned with `SDITT_CR400_NoStrTIrr_250728_Face.m`.
 
 Build and export the CRH380A vehicle matrices:
 
@@ -146,12 +145,22 @@ stages = result.stages
 missing = result.preparation.missing_stages
 ```
 
-This builds the MATLAB default `07(009)` / `Face` / `350 km/h` /
+This builds the default `07(009)` / `Face` / `350 km/h` /
 `FT-Modal` / `CRH380A_v6` system and executes the two-stage
 `Preload -> Cal` coupled loop with the modal FT gravity preload
-applied as the baseline external force and the default `07(009)` / `Face`
-profile selector available through `result.preparation.profile_selector`.
-For the MATLAB default straight-layout route, the current driver evaluates the
+applied as the baseline external force. The default contact selector uses the
+same constant measured basic-rail section on both sides. The matrices, gravity
+preload, and structural dynamics still come from the flexible-turnout model,
+so this is an interval contact-geometry surrogate rather than a complete
+interval track dynamics model.
+
+The original turnout contact route remains available from the command line:
+
+```bash
+python -m sditt.validation.full_case_short_run --rail-layout turnout --steps 2 --cut-freq 50
+```
+
+For the straight-layout route, the current driver evaluates the
 CRH380A_v6 nonlinear vehicle damper stage, the default rigid-wheel contact
 route, and the MATLAB-style iteration/output storage path. For this straight
 FT-Modal route, `missing_stages` is expected to be empty; the remaining

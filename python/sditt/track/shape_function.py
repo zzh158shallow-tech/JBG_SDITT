@@ -95,10 +95,14 @@ def build_default_07009_face_modal_beam_shape_function_context(
 
     values = vehicle_parameters.values if isinstance(vehicle_parameters, VehicleParameters) else vehicle_parameters
     mode_data = _load_modal_shape_function_inputs(str(Path(modal_mat_path).resolve()), float(cut_freq))
-    rail_beam = build_default_07009_face_rail_beam(
-        vlc=operating_case.vlc,
-        choose_turnout=operating_case.choose_turnout,
-        choose_zjg_uneven=choose_zjg_uneven,
+    rail_beam = (
+        RailBeamData()
+        if operating_case.rail_layout == "interval"
+        else build_default_07009_face_rail_beam(
+            vlc=operating_case.vlc,
+            choose_turnout=operating_case.choose_turnout,
+            choose_zjg_uneven=choose_zjg_uneven,
+        )
     )
     return ModalBeamShapeFunctionContext(
         n_track=mode_data["n_track"],

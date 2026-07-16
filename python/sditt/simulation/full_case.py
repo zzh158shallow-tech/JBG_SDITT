@@ -18,12 +18,12 @@ from sditt.contact import (
     solve_default_wheel_rail_contact,
     trace_wheel_profile,
 )
-from sditt.config import MATLAB_FULL_DEFAULT_CASE, DefaultOperatingCase, ProjectPaths, SimulationStage
+from sditt.config import DEFAULT_OPERATING_CASE, DefaultOperatingCase, ProjectPaths, SimulationStage
 from sditt.integrators import LinearSecondOrderSystem
 from sditt.profiles import (
-    DefaultRailProfileSelector,
+    RailProfileSelector,
     WheelProfileSet,
-    build_default_07009_face_profile_selector,
+    build_default_rail_profile_selector,
     build_wheel_profiles,
     rail_profile_numbers,
 )
@@ -170,7 +170,7 @@ class FullDefaultCasePreparation:
     vehicle: VehicleMatrices
     vehicle_parameters: Any
     gravity_preload: ModalFTGravityPreload
-    profile_selector: DefaultRailProfileSelector
+    profile_selector: RailProfileSelector
     wheel_profiles: WheelProfileSet
     shape_function_context: ModalBeamShapeFunctionContext
     track_contact_parameters: DefaultTrackContactParameters
@@ -560,7 +560,7 @@ def find_default_full_case_checkpoint(
     *,
     repo_root: str | Path | None = None,
     settings: FullDefaultCaseSettings | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> dict[str, Any] | None:
     summaries = list_default_full_case_checkpoints(
         repo_root=repo_root,
@@ -574,7 +574,7 @@ def list_default_full_case_checkpoints(
     *,
     repo_root: str | Path | None = None,
     settings: FullDefaultCaseSettings | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> tuple[dict[str, Any], ...]:
     preparation = prepare_default_full_case(repo_root=repo_root, settings=settings, operating_case=operating_case)
     return _list_compatible_run_checkpoints(preparation)
@@ -585,7 +585,7 @@ def load_default_full_case_checkpoint_summary(
     *,
     repo_root: str | Path | None = None,
     settings: FullDefaultCaseSettings | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> dict[str, Any] | None:
     preparation = prepare_default_full_case(repo_root=repo_root, settings=settings, operating_case=operating_case)
     path = Path(checkpoint_path)
@@ -703,7 +703,7 @@ def prepare_default_full_case(
     *,
     repo_root: str | Path | None = None,
     settings: FullDefaultCaseSettings | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> FullDefaultCasePreparation:
     """Build the default MATLAB case matrices and report remaining migration gaps."""
 
@@ -739,7 +739,7 @@ def prepare_default_full_case(
         n_wheels=operating_case.n_wheels,
         n_rv=operating_case.n_rv,
     )
-    profile_selector = build_default_07009_face_profile_selector(
+    profile_selector = build_default_rail_profile_selector(
         repo_root=paths.root,
         vehicle_parameters=vehicle_parameters,
         operating_case=operating_case,
@@ -788,7 +788,7 @@ def run_default_full_case_driver(
     *,
     repo_root: str | Path | None = None,
     settings: FullDefaultCaseSettings | None = None,
-    operating_case: DefaultOperatingCase = MATLAB_FULL_DEFAULT_CASE,
+    operating_case: DefaultOperatingCase = DEFAULT_OPERATING_CASE,
 ) -> FullDefaultCaseRunResult:
     """Run the current Python full-case driver through `Preload -> Cal`.
 
@@ -1172,6 +1172,8 @@ def _matlab_mileage_step_dt(
 ) -> float:
     """Apply MATLAB's `Pos_WS` small-step windows around the crossing region."""
 
+    if preparation.operating_case.rail_layout != "turnout":
+        return float(nominal_dt)
     if preparation.operating_case.choose_turnout != "07(009)":
         return float(nominal_dt)
     vehicle = preparation.vehicle_parameters.values

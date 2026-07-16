@@ -50,19 +50,22 @@ Do not try to fetch these large/private files from GitHub; they are ignored on
 purpose. If the new machine lacks them, profile reading and full FT-Modal runs
 will fail even though the source code is installed correctly.
 
-## Current Supported Operating Case
+## Current Supported Operating Cases
 
-- The actively debugged Python route is the `07(009)` turnout, `Face`
-  direction, default straight FT-Modal / CRH380A_v6 case.
-- The right rail contact profile is built from the combined dummy rails
-  `R1 + R2 + R3`; this mirrors the MATLAB `Get_Profile_P2_v2.m` combined
-  profile behavior.
+- The default Python route uses `interval` contact geometry: left and right are
+  the same constant standard basic-rail section, represented by `L1 + R1`.
+- This is currently a contact-geometry variant only. It still uses the
+  `07(009)` flexible-turnout FT-Modal matrices, gravity preload, and structural
+  dynamics as a surrogate; it is not yet a complete interval track model.
+- The original `07(009)` turnout contact route remains available with
+  `--rail-layout turnout`. Its right profile is the combined `R1 + R2 + R3`
+  profile matching MATLAB `Get_Profile_P2_v2.m`.
 - The realtime profile display is intentionally stabilized on the front
   wheelset (`FF`) so the displayed mileage/profile does not jump between
   wheelsets.
-- The realtime force display defaults to the first wheelset only. For `07(009)`
-  this means the plotted patch force curves are normally `FF-L1`, `FF-R1`,
-  `FF-R2`, and `FF-R3`. The progress CSV still records all patch force columns.
+- The realtime force display defaults to the first wheelset only. Interval mode
+  shows `FF-L1` and `FF-R1`; turnout mode also shows `FF-R2` and `FF-R3`.
+  The progress CSV still records all patch force columns.
 
 ## Common Run Commands
 
@@ -72,6 +75,9 @@ virtual environment from the setup section, activate it first:
 - Short validation run:
   - `cd python`
   - `python -m sditt.validation.full_case_short_run --steps 2 --cut-freq 50`
+- Original turnout validation run:
+  - `cd python`
+  - `python -m sditt.validation.full_case_short_run --rail-layout turnout --steps 2 --cut-freq 50`
 - Realtime window short run:
   - `cd python`
   - `python -m sditt.validation.full_case_short_run --live-window --steps 2 --cut-freq 50`
