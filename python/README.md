@@ -180,6 +180,168 @@ and the corresponding velocity to wheel–rail contact. With `--save-progress`,
 the `progress/` directory also contains `track_irregularity.csv`,
 `track_irregularity_spectrum.csv`, and `track_irregularity.svg`.
 
+## Network A training data
+
+The interval-layout contact-geometry surrogate dataset uses one accepted
+time-step / wheelset / wheel-side environment per sample. Generate the
+2,000-sample pilot first, then extend the same output to the 20,000-sample
+production dataset:
+
+```bash
+python -m sditt.training_data.network_a generate --mode pilot
+python -m sditt.training_data.network_a generate --mode production
+```
+
+Outputs are written under `outputs/network_a_dataset_v1/` and are ignored by
+Git. The production dataset contains 6,000 accepted coupled samples and 14,000
+parameter samples: 7,600 ordinary contact, 800 targeted flange-related
+multi-contact, 3,500 contact/separation boundary, and 2,100 no-contact samples.
+The targeted samples use Sobol perturbations around profile-specific discovery
+anchors and are accepted only after the traditional geometry teacher confirms
+two separated contact patches with at least one flange-angle patch. All samples
+are grouped into `14,000 / 3,000 / 3,000` train/validation/test splits. Inspect
+the manifest and quality results with:
+
+```bash
+python -m sditt.training_data.network_a inspect outputs/network_a_dataset_v1
+```
+
+Programmatic loading converts floating arrays to `float32` by default while
+preserving masks and metadata:
+
+```python
+from sditt.training_data import load_network_a_dataset
+
+train = load_network_a_dataset("outputs/network_a_dataset_v1", split="train")
+```
+
+## WRCP-Net A1 training
+
+`WRCP-Net A1` means Wheel–Rail Contact Point Network A1 (轮轨接触点网络A1).
+It is the first network-A baseline: a dependency-free NumPy multi-task MLP
+that predicts the contact-patch count and two masked patch-label slots. Train
+and inspect it from the `python/` directory:
+
+```bash
+python -m sditt.models.wrcp_net_a1 train
+python -m sditt.models.wrcp_net_a1 inspect outputs/wrcp_net_a1
+```
+
+The ignored `outputs/wrcp_net_a1/` directory contains the compressed model,
+training history, validation/test metrics, test predictions, and provenance
+manifest. The first version uses class-weighted cross entropy for contact state
+and masked Huber loss (胡贝尔损失，兼顾平方误差与异常值鲁棒性) for continuous
+patch labels, with additional weight on the second contact slot.
+
+## WRCP-Net A2G geometry-aware training
+
+`WRCP-Net A2G` is the geometry-aware successor. It predicts a 257-point
+canonical gap/penetration field and the contact topology, then reconstructs
+patch boundaries, wheel/rail points, penetration and contact angle from the
+fixed profiles. When the predicted topology agrees with the native profile
+topology, a deterministic profile-consistency refinement removes compact-grid
+quantisation from the final coordinates without overriding the predicted
+contact class. Generate the field cache and train in one command:
+
+```bash
+python -m sditt.models.wrcp_net_a2g train
+python -m sditt.models.wrcp_net_a2g inspect outputs/wrcp_net_a2g
+```
+
+The field cache is written to `outputs/network_a_gap_field_v1/`; the trained
+model and comparison metrics are written to `outputs/wrcp_net_a2g/`. Both are
+ignored by Git.
+
+Use A2G as a strict replacement for the traditional multi-point geometry
+search in the interval full case with:
+
+```bash
+python -m sditt.validation.full_case_short_run \
+  --rail-layout interval \
+  --contact-geometry-mode network-a \
+  --network-a-model outputs/wrcp_net_a2g/model.npz \
+  --steps 2 \
+  --cut-freq 50
+```
+
+This mode has no traditional-geometry fallback. A predicted/reconstructed
+patch-count mismatch, non-finite geometry, a missing model, or a non-interval
+layout raises an error. STRIPES/Hertz/Kalker force calculation and the coupled
+dynamics remain unchanged after A2G supplies the contact geometry.
+
+To establish the preload equilibrium with traditional geometry and switch to
+strict A2G geometry only for the subsequent `Cal` stage, use:
+
+```bash
+python -m sditt.validation.full_case_short_run \
+  --rail-layout interval \
+  --contact-geometry-mode network-a-after-preload \
+  --network-a-model outputs/wrcp_net_a2g/model.npz \
+  --network-a-trace-dir outputs/network_a_runtime_trace \
+  --track-irregularity china-ballastless \
+  --irregularity-seed 20260716 \
+  --steps 2 \
+  --cut-freq 50
+```
+
+The optional trace directory contains compressed per-iteration shards and
+`accepted_steps.jsonl`. Repeated nonlinear iterations and reduced-`dt` retries
+are retained as diagnostic candidate states. They are not teacher labels: join
+accepted keys as needed and rerun the traditional geometry teacher before
+promoting selected rows into a future training dataset.
+
+## WRCP-Net A2R continuity refinement
+
+`WRCP-Net A2R` adds independent left/right bounded penetration-residual heads,
+accepted-step continuity state, contact-branch hysteresis, and candidate-region
+fixed-profile interpolation to the frozen A2G gap-field model. Build its v2
+teacher dataset and micron-scale perturbation pairs, then train with higher
+weights for high-iteration, reduced-`dt`, left-side, and accepted states:
+
+```bash
+python -m sditt.models.wrcp_net_a2r build-dataset \
+  --trace outputs/network_a_runtime_trace_irregularity_full_seed20260716 \
+  --output outputs/network_a_runtime_teacher_v2_continuity \
+  --repo-root .. \
+  --base-model outputs/wrcp_net_a2g/model.npz
+
+python -m sditt.models.wrcp_net_a2r train \
+  --dataset outputs/network_a_runtime_teacher_v2_continuity \
+  --base-model outputs/wrcp_net_a2g/model.npz \
+  --output outputs/wrcp_net_a2r_continuity \
+  --left-residual-gain 1.0 \
+  --right-residual-gain 1.0 \
+  --smooth-weight 0.25 \
+  --rate-reference-dataset outputs/network_a_dataset_v1/all_samples.npz
+```
+
+The deployed continuity envelope uses the 99.5th percentile of adjacent
+traditional coupled steps. Ordinary changes pass through unchanged; only
+out-of-envelope changes activate `alpha=0.3` under-relaxation and rate clipping.
+Every nonlinear retry remains anchored to the preceding accepted step, and
+history is committed only after the integrator accepts the step. The model is
+still an A2G-compatible artifact and introduces no traditional fallback.
+
+Run it after traditional preload with a new v2 trace directory:
+
+```bash
+python -m sditt.validation.full_case_short_run \
+  --rail-layout interval \
+  --contact-geometry-mode network-a-after-preload \
+  --network-a-model outputs/wrcp_net_a2r_continuity/model.npz \
+  --network-a-trace-dir outputs/network_a_runtime_trace_a2r_continuity \
+  --track-irregularity china-ballastless \
+  --irregularity-seed 20260716 \
+  --steps 200 \
+  --cut-freq 50 \
+  --save-progress
+```
+
+The v2 runtime trace separately records base penetration, bounded residual,
+slew-limited residual, network penetration, final used penetration, branch
+hysteresis, and continuity-limit flags. Do not append v2 records to a v1 trace
+directory.
+
 For the straight-layout route, the current driver evaluates the
 CRH380A_v6 nonlinear vehicle damper stage, the default rigid-wheel contact
 route, and the MATLAB-style iteration/output storage path. For this straight

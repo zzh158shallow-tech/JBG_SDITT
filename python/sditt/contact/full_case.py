@@ -15,7 +15,12 @@ from sditt.contact.forces import (
     normal_damping_window,
     stripes_normal_force,
 )
-from sditt.contact.geometry import WheelPose2D, multi_point_contact_geometry, single_point_contact_geometry
+from sditt.contact.geometry import (
+    MultiPointContactGeometry,
+    WheelPose2D,
+    multi_point_contact_geometry,
+    single_point_contact_geometry,
+)
 from sditt.profiles.geometry import TrackProfileSet, WheelProfileSet, build_track_profiles, contact_tables, offset_profile_to_track
 from sditt.track.irregularity import TrackIrregularityProfile, TrackIrregularitySample
 
@@ -47,6 +52,7 @@ class FullCaseWheelRailContactResult:
     track_profiles: dict[str, TrackProfileSet]
     d0_by_wheelset: dict[str, float]
     relvel_max_by_wheelset: dict[str, dict[str, float]]
+    geometry_by_wheelset_side: dict[str, dict[str, MultiPointContactGeometry | None]]
     damping_clip_diagnostics: tuple[dict[str, Any], ...] = ()
 
 
@@ -66,6 +72,8 @@ def solve_default_wheel_rail_contact(
     previous_relvel_max_by_wheelset: Mapping[str, Mapping[str, float]] | None = None,
     use_cal_d0_trace: bool = True,
     track_irregularity: TrackIrregularityProfile | None = None,
+    network_a_adapter: Any | None = None,
+    network_a_diagnostic_context: Mapping[str, Any] | None = None,
 ) -> FullCaseWheelRailContactResult:
     """Assemble the default rigid-wheel full-case contact route.
 
@@ -82,6 +90,8 @@ def solve_default_wheel_rail_contact(
     exp_dummy_rail_side = list(inp_par["Exp_DummyRail_WheelSide"])
     left_dummy_rails = tuple(inp_par["Exp_DummyRail_L"])
     right_dummy_rails = tuple(inp_par["Exp_DummyRail_R"])
+    if network_a_adapter is not None and (len(left_dummy_rails) != 1 or len(right_dummy_rails) != 1):
+        raise ValueError("WRCP-Net A2G full replacement supports interval L1+R1 layout only")
     wheel_distances = _wheelset_distances(vehicle_parameters, exp_ws)
 
     displacement = np.asarray(displacement, dtype=float)
@@ -95,6 +105,7 @@ def solve_default_wheel_rail_contact(
     track_profiles: dict[str, TrackProfileSet] = {}
     result_d0_by_wheelset: dict[str, float] = {}
     result_relvel_max_by_wheelset: dict[str, dict[str, float]] = {}
+    geometry_by_wheelset_side: dict[str, dict[str, MultiPointContactGeometry | None]] = {}
     damping_clip_diagnostics: list[dict[str, Any]] = []
     wheel_radius_profiles = {"L": wheel_profiles.radius_left, "R": wheel_profiles.radius_right}
     wheel_shape_profiles = {"L": wheel_profiles.left, "R": wheel_profiles.right}
@@ -136,6 +147,7 @@ def solve_default_wheel_rail_contact(
             )
         result_d0_by_wheelset[wheelset] = d0
         result_relvel_max_by_wheelset[wheelset] = {}
+        geometry_by_wheelset_side[wheelset] = {}
 
         con_ws[wheelset] = {
             "Mileage": mileage,
@@ -165,6 +177,26 @@ def solve_default_wheel_rail_contact(
         }
 
         for side in ("L", "R"):
+            geometry_override = None
+            if network_a_adapter is not None:
+                side_patch_index = exp_dummy_rail_side.index(side)
+                contact_index = n_contact_patch * wheel_index + side_patch_index
+                rail_shift_yz = np.asarray(rail_response.dis_rail[contact_index, 1:3], dtype=float).copy()
+                if irregularity_sample is not None:
+                    rail_shift_yz += np.asarray(irregularity_sample.rail_displacement_m[side], dtype=float)
+                geometry_override = network_a_adapter.solve(
+                    side=side,
+                    pose=pose,
+                    d0=d0,
+                    rail_shift_yz=rail_shift_yz,
+                    diagnostic_context={
+                        **dict(network_a_diagnostic_context or {}),
+                        "front_mileage_m": float(front_mileage),
+                        "actual_mileage_m": float(mileage),
+                        "wheelset": wheelset,
+                        "side": side,
+                    },
+                )
             side_result = _solve_wheel_side_contact(
                 inp_par,
                 vehicle_parameters,
@@ -187,6 +219,7 @@ def solve_default_wheel_rail_contact(
                     else None
                 ),
                 track_irregularity_sample=irregularity_sample,
+                geometry_override=geometry_override,
             )
             con_ws[wheelset]["Normal_Force"][side] = side_result["normal_force"]
             con_ws[wheelset]["Con_wheel_2"][side] = side_result["con_wheel_2"]
@@ -206,6 +239,7 @@ def solve_default_wheel_rail_contact(
             con_ws[wheelset]["Vsdc"][side] = side_result["vsdc"]
             con_ws[wheelset]["Vjsdc"][side] = side_result["vjsdc"]
             con_ws[wheelset]["Vgd"][side] = side_result["vgd"][:, np.newaxis]
+            geometry_by_wheelset_side[wheelset][side] = side_result["geometry"]
             con_ws[wheelset]["Normal_Damping_Clips"] = con_ws[wheelset].get(
                 "Normal_Damping_Clips", {"L": (), "R": ()}
             )
@@ -276,6 +310,7 @@ def solve_default_wheel_rail_contact(
         track_profiles=track_profiles,
         d0_by_wheelset=result_d0_by_wheelset,
         relvel_max_by_wheelset=result_relvel_max_by_wheelset,
+        geometry_by_wheelset_side=geometry_by_wheelset_side,
         damping_clip_diagnostics=tuple(damping_clip_diagnostics),
     )
 
@@ -338,22 +373,27 @@ def _solve_wheel_side_contact(
     exp_dummy_rail: list[str],
     previous_relvel_max_by_dummy_rail: Mapping[str, float] | None,
     track_irregularity_sample: TrackIrregularitySample | None,
-) -> dict[str, np.ndarray]:
+    geometry_override: MultiPointContactGeometry | None = None,
+) -> dict[str, Any]:
     rail_profile = np.asarray(track_profile.profile[side], dtype=float)
     if rail_profile.size == 0:
         return _empty_side_result()
 
-    geometry = multi_point_contact_geometry(
-        wheel_profile,
-        wheel_angles,
-        rail_profile,
-        pose=pose,
-        penetration_offset=d0,
-        min_overlap_margin=1.0e-4,
-        dlb=float(vehicle_parameters["Dlb"]),
-    )
+    geometry = geometry_override
+    if geometry is None:
+        geometry = multi_point_contact_geometry(
+            wheel_profile,
+            wheel_angles,
+            rail_profile,
+            pose=pose,
+            penetration_offset=d0,
+            min_overlap_margin=1.0e-4,
+            dlb=float(vehicle_parameters["Dlb"]),
+        )
     if not geometry.patches:
-        return _empty_side_result()
+        result = _empty_side_result()
+        result["geometry"] = geometry
+        return result
 
     patch_count = len(geometry.patches)
     transforms = np.zeros((patch_count, 3, 3), dtype=float)
@@ -536,6 +576,7 @@ def _solve_wheel_side_contact(
         normal_force[i, 3] = float(patch_ids[i])
 
     return {
+        "geometry": geometry,
         "normal_force": normal_force,
         "con_wheel_2": con_wheel_2[:, :3],
         "con_wheel_2_full": con_wheel_2,
@@ -973,8 +1014,9 @@ def _right_matrix_divide(values: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return np.linalg.solve(np.asarray(matrix, dtype=float).T, np.asarray(values, dtype=float).T).T
 
 
-def _empty_side_result() -> dict[str, np.ndarray]:
+def _empty_side_result() -> dict[str, Any]:
     return {
+        "geometry": None,
         "normal_force": np.zeros((0, 4), dtype=float),
         "con_wheel_2": np.zeros((0, 3), dtype=float),
         "con_wheel_2_full": np.zeros((0, 6), dtype=float),

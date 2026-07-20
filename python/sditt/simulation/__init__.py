@@ -14,6 +14,7 @@ from .coupled import (
     run_coupled_time_iteration,
 )
 from .full_case import (
+    FullCaseAcceptedContactSnapshot,
     FullCaseContactDiagnostics,
     FullCaseFrozenContactInput,
     FullCaseIterationRecord,
@@ -56,6 +57,7 @@ __all__ = [
     "CoupledStepCallbacks",
     "CoupledStepState",
     "CoupledTimeIterationResult",
+    "FullCaseAcceptedContactSnapshot",
     "FullCaseContactDiagnostics",
     "FullCaseFrozenContactInput",
     "FullCaseIterationRecord",

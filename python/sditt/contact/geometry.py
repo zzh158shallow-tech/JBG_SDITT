@@ -35,6 +35,16 @@ class PreparedWheelTraceProfile:
 
 
 @dataclass(frozen=True)
+class PreparedContactProfileGeometry:
+    """Pose-dependent wheel/rail interpolants before contact-point search."""
+
+    wheel_interp: np.ndarray
+    rail_interp: np.ndarray
+    contact_angles: np.ndarray
+    wheel_profile_lateral: np.ndarray
+
+
+@dataclass(frozen=True)
 class SinglePointContact:
     """One Hertz-style normal contact geometry result."""
 
@@ -231,12 +241,18 @@ def multi_point_contact_geometry(
     point to the weighted quasi-elastic center of its interval.
     """
 
-    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose, dlb=dlb)
-    wheel_interp, rail_interp, angles, wheel_lateral = _overlap_interpolants(
-        trace,
+    prepared = prepare_contact_profile_geometry(
+        wheel_profile,
+        contact_angle_table,
         rail_profile,
+        pose=pose,
         min_overlap_margin=min_overlap_margin,
+        dlb=dlb,
     )
+    wheel_interp = prepared.wheel_interp
+    rail_interp = prepared.rail_interp
+    angles = prepared.contact_angles
+    wheel_lateral = prepared.wheel_profile_lateral
     if wheel_interp.size == 0:
         empty = np.empty((0, 2), dtype=float)
         boundaries = extreme_boundary(empty)
@@ -271,6 +287,31 @@ def multi_point_contact_geometry(
         wheel_profile_lateral=wheel_lateral,
         boundaries=boundaries,
         patches=patches,
+    )
+
+
+def prepare_contact_profile_geometry(
+    wheel_profile: np.ndarray,
+    contact_angle_table: np.ndarray,
+    rail_profile: np.ndarray,
+    *,
+    pose: WheelPose2D | None = None,
+    min_overlap_margin: float = 0.0,
+    dlb: float | None = None,
+) -> PreparedContactProfileGeometry:
+    """Build native profile interpolants without searching for contact patches."""
+
+    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose, dlb=dlb)
+    wheel_interp, rail_interp, angles, wheel_lateral = _overlap_interpolants(
+        trace,
+        rail_profile,
+        min_overlap_margin=min_overlap_margin,
+    )
+    return PreparedContactProfileGeometry(
+        wheel_interp=wheel_interp,
+        rail_interp=rail_interp,
+        contact_angles=angles,
+        wheel_profile_lateral=wheel_lateral,
     )
 
 

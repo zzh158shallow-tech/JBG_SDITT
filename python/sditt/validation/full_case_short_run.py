@@ -34,6 +34,7 @@ from sditt.track import (
 DEFAULT_OUTPUT_DIR = Path("python/outputs/full_case_short_run")
 DEFAULT_ABS_TOLERANCE = 1.0e-6
 DEFAULT_REL_TOLERANCE = 1.0e-4
+DEFAULT_NETWORK_A_MODEL = Path("outputs/wrcp_net_a2g/model.npz")
 _PATCH_FORCE_COLORS = (
     "#1f77b4",
     "#ff7f0e",
@@ -86,6 +87,9 @@ def build_python_short_run_snapshot(
     rail_layout: RailLayout = "interval",
     track_irregularity: TrackIrregularityModel = "none",
     irregularity_seed: int = 20260716,
+    contact_geometry_mode: str = "traditional",
+    network_a_model_path: str | Path = DEFAULT_NETWORK_A_MODEL,
+    network_a_trace_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
 
@@ -103,6 +107,9 @@ def build_python_short_run_snapshot(
         resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_callback,
         track_irregularity=TrackIrregularitySettings(model=track_irregularity, seed=irregularity_seed),
+        contact_geometry_mode=contact_geometry_mode,
+        network_a_model_path=network_a_model_path,
+        network_a_trace_dir=network_a_trace_dir,
     )
     result = run_default_full_case_driver(
         settings=settings,
@@ -120,6 +127,18 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
         "settings": {
             "rail_layout": preparation.operating_case.rail_layout,
             "track_irregularity": irregularity,
+            "contact_geometry_mode": preparation.settings.contact_geometry_mode,
+            "network_a_model_path": (
+                None
+                if preparation.network_a_contact_adapter is None
+                else str(preparation.network_a_contact_adapter.model_path)
+            ),
+            "network_a_trace_dir": (
+                None
+                if preparation.network_a_contact_adapter is None
+                or preparation.network_a_contact_adapter.trace_writer is None
+                else str(preparation.network_a_contact_adapter.trace_writer.output_dir)
+            ),
             "cut_freq": preparation.settings.cut_freq,
             "dt": preparation.settings.dt,
             "n_steps_per_stage": preparation.settings.n_steps_per_stage,
@@ -208,6 +227,9 @@ def write_full_case_short_run_report(
     rail_layout: RailLayout = "interval",
     track_irregularity: TrackIrregularityModel = "none",
     irregularity_seed: int = 20260716,
+    contact_geometry_mode: str = "traditional",
+    network_a_model_path: str | Path = DEFAULT_NETWORK_A_MODEL,
+    network_a_trace_dir: str | Path | None = None,
 ) -> tuple[Path, Path]:
     """Write a Python snapshot and Markdown error report for a short full-case run."""
 
@@ -232,6 +254,9 @@ def write_full_case_short_run_report(
         rail_layout=rail_layout,
         track_irregularity=track_irregularity,
         irregularity_seed=irregularity_seed,
+        contact_geometry_mode=contact_geometry_mode,
+        network_a_model_path=network_a_model_path,
+        network_a_trace_dir=network_a_trace_dir,
     )
     snapshot_path = output_path / "python_snapshot.json"
     snapshot_path.write_text(_json_dumps(python_snapshot), encoding="utf-8")
@@ -1944,6 +1969,9 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
                 rail_layout=args.rail_layout,
                 track_irregularity=args.track_irregularity,
                 irregularity_seed=args.irregularity_seed,
+                contact_geometry_mode=args.contact_geometry_mode,
+                network_a_model_path=args.network_a_model,
+                network_a_trace_dir=args.network_a_trace_dir,
             )
         except Exception as exc:  # pragma: no cover - exercised manually with GUI failures.
             state["error"] = f"{type(exc).__name__}: {exc}"
@@ -2023,6 +2051,9 @@ def _checkpoint_settings_for_args(args: argparse.Namespace, *, cut_freq: float |
             model=args.track_irregularity,
             seed=args.irregularity_seed,
         ),
+        contact_geometry_mode=args.contact_geometry_mode,
+        network_a_model_path=args.network_a_model,
+        network_a_trace_dir=args.network_a_trace_dir,
     )
 
 
@@ -2060,6 +2091,30 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=int,
         default=20260716,
         help="Random-phase seed used by the track-irregularity reconstruction.",
+    )
+    parser.add_argument(
+        "--contact-geometry-mode",
+        choices=("traditional", "network-a", "network-a-after-preload"),
+        default="traditional",
+        help=(
+            "Use traditional geometry, strict WRCP-Net A2G replacement, or traditional "
+            "Preload followed by strict A2G replacement in Cal."
+        ),
+    )
+    parser.add_argument(
+        "--network-a-model",
+        type=Path,
+        default=DEFAULT_NETWORK_A_MODEL,
+        help="WRCP-Net A2G model artifact used by --contact-geometry-mode network-a.",
+    )
+    parser.add_argument(
+        "--network-a-trace-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Write sharded per-iteration A2G inputs, predictions, reconstructed geometry, "
+            "and accepted-step keys for later teacher relabelling."
+        ),
     )
     parser.add_argument("--dt", type=float, default=1.0e-4)
     parser.add_argument("--steps", type=int, default=1)
@@ -2150,6 +2205,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         rail_layout=args.rail_layout,
         track_irregularity=args.track_irregularity,
         irregularity_seed=args.irregularity_seed,
+        contact_geometry_mode=args.contact_geometry_mode,
+        network_a_model_path=args.network_a_model,
+        network_a_trace_dir=args.network_a_trace_dir,
     )
     print(f"wrote {snapshot_path}")
     print(f"wrote {report_path}")

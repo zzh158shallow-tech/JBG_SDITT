@@ -1,0 +1,69 @@
+{
+  "model_name": "WRCP-Net A2R",
+  "model_id": "wrcp-net-a2r",
+  "base_model": "/Users/zhou/Documents/Codex/JBG_SDITT/python/outputs/wrcp_net_a2g/model.npz",
+  "base_model_sha256": "1007a201ea6772dc748a51323cb4a8beff19208abf67d16fe583e50123be0608",
+  "dataset_manifest_sha256": "315effa8a426af53600f469dfa6c4d560ef54a0163977fe20be0782182833269",
+  "hidden_sizes": [
+    64,
+    64
+  ],
+  "best_epochs": {
+    "L": 398,
+    "R": 17
+  },
+  "target_scale_m": [
+    9.999999974752427e-07,
+    9.999999974752427e-07,
+    9.999999974752427e-07,
+    9.999999974752427e-07
+  ],
+  "residual_gain": {
+    "L": 1.0,
+    "R": 1.0
+  },
+  "residual_limit_m": [
+    [
+      4.999999873689376e-06,
+      4.999999873689376e-06,
+      4.999999873689376e-06,
+      4.999999873689376e-06
+    ],
+    [
+      4.999999873689376e-06,
+      4.999999873689376e-06,
+      4.999999873689376e-06,
+      4.999999873689376e-06
+    ]
+  ],
+  "residual_gain_reason": "closed-loop damping calibrated on an unseen irregularity short run",
+  "continuity_alpha": 0.3,
+  "rate_quantile": 0.995,
+  "penetration_rate_m_per_s": [
+    [
+      1.243919014930725,
+      1.2424664497375488
+    ],
+    [
+      1.2171506881713867,
+      1.2230116128921509
+    ]
+  ],
+  "contact_location_rate_m_per_s": [
+    6.372399806976318,
+    5.299213409423828
+  ],
+  "rate_reference_source": "/Users/zhou/Documents/Codex/JBG_SDITT/python/outputs/network_a_dataset_v1/all_samples.npz",
+  "residual_rate_m_per_s": [
+    [
+      0.045104868710041046,
+      0.0010000000474974513
+    ],
+    [
+      0.03518861159682274,
+      0.0010000000474974513
+    ]
+  ],
+  "smooth_weight": 0.25,
+  "model_sha256": "600168afd02edfa129681782093ced811445db27f470629a90328693ef584d70"
+}

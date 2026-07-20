@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -212,6 +213,24 @@ def test_full_case_short_run_validation_defaults_to_not_saving_checkpoints() -> 
     assert args.rail_layout == "interval"
     assert args.track_irregularity == "none"
     assert args.irregularity_seed == 20260716
+    assert args.contact_geometry_mode == "traditional"
+
+
+def test_full_case_short_run_parses_network_a_after_preload() -> None:
+    args = _parse_args(
+        [
+            "--contact-geometry-mode",
+            "network-a-after-preload",
+            "--network-a-model",
+            "outputs/custom-a2g/model.npz",
+            "--network-a-trace-dir",
+            "outputs/custom-a2g/trace",
+        ]
+    )
+
+    assert args.contact_geometry_mode == "network-a-after-preload"
+    assert args.network_a_model == Path("outputs/custom-a2g/model.npz")
+    assert args.network_a_trace_dir == Path("outputs/custom-a2g/trace")
 
 
 def test_full_case_short_run_validation_parses_turnout_layout() -> None:
