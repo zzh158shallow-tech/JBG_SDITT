@@ -13,6 +13,7 @@ from scipy.stats import qmc
 
 from sditt.config import DEFAULT_OPERATING_CASE, ProjectPaths
 from sditt.contact import MultiPointContactGeometry, WheelPose2D, multi_point_contact_geometry
+from sditt.contact.geometry import PreparedRailProfileInterpolator, prepare_rail_profile_interpolator
 from sditt.contact.full_case import DefaultTrackContactParameters
 from sditt.profiles import (
     TrackProfileSet,
@@ -168,6 +169,7 @@ class NetworkATeacherContext:
     track_profiles: TrackProfileSet
     dlb: float
     profile_hashes: dict[str, str]
+    prepared_rail_interpolators: dict[str, PreparedRailProfileInterpolator]
 
 
 @dataclass(frozen=True)
@@ -288,6 +290,10 @@ def build_network_a_teacher_context(repo_root: str | Path | None = None) -> Netw
         track_profiles=track_profiles,
         dlb=float(vehicle.values["Dlb"]),
         profile_hashes={name: _sha256_file(path) for name, path in source_files.items()},
+        prepared_rail_interpolators={
+            side: prepare_rail_profile_interpolator(track_profiles.profile[side])
+            for side in ("L", "R")
+        },
     )
 
 

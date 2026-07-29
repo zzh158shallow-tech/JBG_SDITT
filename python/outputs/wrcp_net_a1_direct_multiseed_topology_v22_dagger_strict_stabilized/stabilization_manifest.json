@@ -1,0 +1,123 @@
+{
+  "schema": "wrcp-net-a1-direct-accepted-step-stabilizer-v1",
+  "base_model": "outputs/wrcp_net_a1_direct_multiseed_topology_v22_dagger_strict/model.npz",
+  "calibration_dataset": "outputs/network_a_direct_multiseed_full_cal_v5_33seed_transition128/train.npz",
+  "source": "full_cal_accepted",
+  "quantile": 0.999,
+  "safety_factor": 8.0,
+  "matched_patch_increments": 362592,
+  "increment_names": [
+    "center_y_m",
+    "left_half_width_m",
+    "right_half_width_m",
+    "corrected_vertical_penetration_m",
+    "peak_rail_y_m",
+    "peak_penetration_increment_m",
+    "shape_moment_1",
+    "shape_moment_1p5",
+    "shape_moment_2"
+  ],
+  "increment_limits": [
+    4.170327111928682e-05,
+    0.0005,
+    0.0005,
+    9.968718496151193e-06,
+    0.0001999156459330926,
+    7.015329868659467e-08,
+    0.014742975133144485,
+    0.012888516744325266,
+    0.011529284447716677
+  ],
+  "increment_floors": [
+    2e-05,
+    0.0001,
+    0.0001,
+    2e-06,
+    2e-05,
+    2e-08,
+    0.003,
+    0.003,
+    0.003
+  ],
+  "increment_ceilings": [
+    0.00025,
+    0.0005,
+    0.0005,
+    2e-05,
+    0.00025,
+    2e-07,
+    0.02,
+    0.02,
+    0.02
+  ],
+  "shape_increment_limits_enabled": true,
+  "ood_recalibrated_from_dataset": true,
+  "ood_training_support_target_distance": 3.0,
+  "topology_hysteresis_min": 0.9,
+  "physical_angle_min_rad": -0.04616511436423551,
+  "physical_angle_max_rad": 0.046588964761796844,
+  "physical_angle_calibration": "0.1/99.9 percentiles plus 0.02 rad margin",
+  "shape_bounds_quantile": 0.001,
+  "shape_bounds_margin_fraction": 0.1,
+  "shape_moment_lower_quantile": [
+    0.6334137115260379,
+    0.5500179193338495,
+    0.49087426846244214
+  ],
+  "shape_moment_upper_quantile": [
+    0.6529565392779798,
+    0.5720138031139086,
+    0.514033536198863
+  ],
+  "shape_moment_min": [
+    0.6314594287508437,
+    0.5478183309558435,
+    0.4885583416888001
+  ],
+  "shape_moment_max": [
+    0.654910822053174,
+    0.5742133914919145,
+    0.5163494629725052
+  ],
+  "shape_bounds_calibration": "training dataset only",
+  "shape_moment_history_blend": 1.0,
+  "derived_rail_z_ood_multiplier": 1.0,
+  "derived_rail_z_ood_names": [
+    "corrected_rail_z_m",
+    "peak_rail_z_m"
+  ],
+  "derived_history_ood_multiplier": 1.0,
+  "derived_history_ood_names": [
+    "corrected_wheel_x_m",
+    "corrected_wheel_y_m",
+    "corrected_wheel_z_m",
+    "corrected_rail_z_m",
+    "wheel_profile_lateral_m",
+    "corrected_contact_angle_rad",
+    "peak_wheel_x_m",
+    "peak_wheel_y_m",
+    "peak_wheel_z_m",
+    "peak_rail_z_m",
+    "peak_contact_angle_rad"
+  ],
+  "strict_independent_history_names": [
+    "corrected_rail_y_m",
+    "corrected_vertical_penetration_m",
+    "patch_end_y_m",
+    "patch_start_y_m",
+    "peak_rail_y_m",
+    "peak_vertical_penetration_m",
+    "shape_moment_1",
+    "shape_moment_1p5",
+    "shape_moment_2"
+  ],
+  "shape_history_ood_multiplier": 1.0,
+  "shape_history_ood_names": [
+    "shape_moment_1",
+    "shape_moment_1p5",
+    "shape_moment_2"
+  ],
+  "ood_threshold": 4.0,
+  "topology_confidence_min": 0.949999988079071,
+  "decision": "global OOD threshold and independent-history envelopes are unchanged; configured multipliers apply only to deterministic derived history fields; increment limits apply only when accepted patch counts match; fixed profiles recompute dependent geometry"
+}

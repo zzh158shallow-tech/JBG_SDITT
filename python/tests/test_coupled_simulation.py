@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from sditt.integrators import LinearSecondOrderSystem
@@ -91,6 +93,46 @@ def test_coupled_time_iteration_shrinks_dt_and_retries_unconverged_step() -> Non
     assert result.retry_count.tolist() == [0, 1]
 
 
+def test_coupled_time_iteration_extends_after_retry_until_time_end() -> None:
+    system = LinearSecondOrderSystem(
+        mass=np.array([[1.0]]),
+        damping=np.array([[0.0]]),
+        stiffness=np.array([[1.0]]),
+    )
+    fail_nominal_once = True
+
+    def force(state: CoupledStepState, _rail: object, _geometry: object) -> np.ndarray:
+        nonlocal fail_nominal_once
+        if fail_nominal_once and state.dt > 0.005:
+            fail_nominal_once = False
+            return np.array([1.0])
+        return state.force_guess.copy()
+
+    result = run_coupled_time_iteration(
+        system,
+        CoupledStepCallbacks(
+            lambda state: {"dt": state.dt},
+            lambda _state, rail: rail,
+            force,
+        ),
+        dt=0.01,
+        n_steps=2,
+        settings=CoupledIterationSettings(
+            max_iterations=1,
+            force_tolerance=0.0,
+            absolute_force_tolerance=0.0,
+            min_dt=0.0025,
+            shrink_factor=0.5,
+        ),
+        step_dt_callback=lambda _step, time, nominal: min(nominal, 0.02 - time),
+        time_end=0.02,
+    )
+
+    assert result.step_index.tolist() == [0, 1, 2, 3]
+    assert np.allclose(result.dt, [0.0, 0.005, 0.01, 0.005])
+    assert result.time[-1] == 0.02
+
+
 def test_coupled_time_iteration_uses_scheduled_dt_for_each_new_step() -> None:
     system = LinearSecondOrderSystem(
         mass=np.array([[1.0]]),
@@ -146,3 +188,27 @@ def test_coupled_time_iteration_uses_external_force_with_converged_contact() -> 
     assert np.allclose(result.contact_force, 0.0)
     assert np.allclose(result.total_force[:, 0], [0.0, 0.4, 0.8])
     assert np.all(result.iterations[1:] == 1)
+
+
+def test_coupled_time_iteration_accumulates_nested_contact_timing() -> None:
+    system = LinearSecondOrderSystem(
+        mass=np.array([[1.0]]),
+        damping=np.array([[0.0]]),
+        stiffness=np.array([[0.0]]),
+    )
+    callbacks = CoupledStepCallbacks(
+        recover_track_response=lambda state: state.displacement.copy(),
+        contact_geometry=lambda state, rail: SimpleNamespace(
+            timing={"network_a1.predict_total": 0.125}
+        ),
+        contact_force=lambda state, rail, geometry: np.zeros((1,)),
+    )
+
+    result = run_coupled_time_iteration(
+        system,
+        callbacks,
+        dt=0.01,
+        n_steps=2,
+    )
+
+    assert result.timing["contact_geometry.network_a1.predict_total"] == 0.25

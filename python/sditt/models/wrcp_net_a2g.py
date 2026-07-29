@@ -360,40 +360,41 @@ def _geometry_from_predicted_field(
         ),
         min_overlap_margin=1.0e-4,
         dlb=context.dlb,
+        prepared_rail=context.prepared_rail_interpolators[side],
     )
     native_y = structure.wheel_interp[:, 1]
     predicted = np.interp(np.abs(native_y), canonical_y_m, np.asarray(gap_field_m, dtype=float))
     if desired_patch_count <= 0:
         predicted = predicted - max(float(np.max(predicted)), 0.0) - 1.0e-9
     elastic = np.column_stack((native_y, predicted))
-    boundaries = extreme_boundary(elastic, opt="max")
+    boundaries = _positive_boundaries_fast(elastic)
     if desired_patch_count > 0 and boundaries.positive_extrema.shape[0] != desired_patch_count:
         # Match topology on the native profile grid. A threshold selected on
         # the compact learned grid can change component count after
         # interpolation, especially under irregularity-driven edge states.
         predicted_values = np.asarray(predicted, dtype=float)
-        sorted_values = np.unique(np.sort(predicted_values))
-        thresholds = np.concatenate(
-            (
-                np.array([0.0]),
-                sorted_values[:1] - 1.0e-12,
-                0.5 * (sorted_values[:-1] + sorted_values[1:]),
-                sorted_values[-1:] + 1.0e-12,
-            )
+        best_threshold = _topology_matching_threshold(
+            predicted_values,
+            desired_patch_count,
         )
-        best_threshold: float | None = None
-        for threshold in thresholds:
-            positive = predicted_values > float(threshold)
-            component_count = int(
-                np.count_nonzero(positive & ~np.r_[False, positive[:-1]])
-            )
-            if component_count == desired_patch_count and (
-                best_threshold is None or abs(float(threshold)) < abs(best_threshold)
-            ):
-                best_threshold = float(threshold)
         if best_threshold is not None:
             elastic = np.column_stack((native_y, predicted - best_threshold))
-            boundaries = extreme_boundary(elastic, opt="max")
+            boundaries = _positive_boundaries_fast(elastic)
+    if (
+        candidate_profile_refinement
+        and boundaries.positive_extrema.shape[0] == int(desired_patch_count)
+    ):
+        candidate_geometry = _candidate_profile_refinement(
+            structure=structure,
+            features=values,
+            angle_table=angle_table,
+            network_boundaries=boundaries,
+            anchor_patches=tuple(anchor_patches),
+            candidate_margin_m=float(candidate_margin_m),
+        )
+        if candidate_geometry is not None:
+            return candidate_geometry
+
     patches = quasi_elastic_correction(
         elastic,
         boundaries.positive_extrema,
@@ -407,19 +408,8 @@ def _geometry_from_predicted_field(
         yaw=float(features[4]),
         lateral=float(features[1]),
         roll=float(features[3]),
+        assume_sorted=True,
     )
-
-    if candidate_profile_refinement and len(patches) == int(desired_patch_count):
-        candidate_geometry = _candidate_profile_refinement(
-            structure=structure,
-            features=values,
-            angle_table=angle_table,
-            network_patches=patches,
-            anchor_patches=tuple(anchor_patches),
-            candidate_margin_m=float(candidate_margin_m),
-        )
-        if candidate_geometry is not None:
-            return candidate_geometry
 
     # The learned field supplies the contact class/topology. Once that topology
     # agrees with the fixed profiles, reconstruct coordinates on the native
@@ -479,19 +469,134 @@ def _geometry_from_predicted_field(
     )
 
 
+def _topology_matching_threshold(
+    values: np.ndarray,
+    desired_component_count: int,
+) -> float | None:
+    """Return the old closest-to-zero topology threshold without O(n^2) scans.
+
+    The previous implementation tested every midpoint between unique field
+    values and rebuilt a full Boolean vector for each threshold.  A descending
+    one-dimensional rank/difference sweep computes the same component counts
+    in O(n log n) time while retaining the original threshold ordering and tie
+    behaviour.
+    """
+
+    field = np.asarray(values, dtype=float).reshape(-1)
+    if field.size == 0:
+        return None
+    sorted_values, value_ranks = np.unique(field, return_inverse=True)
+    midpoint_counts = _superlevel_midpoint_component_counts(value_ranks, sorted_values.size)
+    thresholds = np.concatenate(
+        (
+            np.array([0.0]),
+            sorted_values[:1] - 1.0e-12,
+            0.5 * (sorted_values[:-1] + sorted_values[1:]),
+            sorted_values[-1:] + 1.0e-12,
+        )
+    )
+    counts = np.concatenate(
+        (
+            np.array([_positive_component_count(field > 0.0)], dtype=int),
+            np.array(
+                [_positive_component_count(field > float(thresholds[1]))],
+                dtype=int,
+            ),
+            midpoint_counts,
+            np.array(
+                [_positive_component_count(field > float(thresholds[-1]))],
+                dtype=int,
+            ),
+        )
+    )
+    matching = np.flatnonzero(counts == int(desired_component_count))
+    if matching.size == 0:
+        return None
+    candidate_thresholds = thresholds[matching]
+    return float(candidate_thresholds[int(np.argmin(np.abs(candidate_thresholds)))])
+
+
+def _positive_boundaries_fast(elastic_penetration: np.ndarray) -> BoundaryExtrema:
+    """Build only the positive components needed by Network A reconstruction."""
+
+    data = np.asarray(elastic_penetration, dtype=float)
+    if data.ndim != 2 or data.shape[1] != 2 or data.shape[0] == 0:
+        empty = np.empty((0, 4), dtype=float)
+        return BoundaryExtrema(empty, empty, empty, empty)
+    positive = data[:, 1] >= 0.0
+    starts = np.flatnonzero(positive & np.concatenate(([True], ~positive[:-1])))
+    ends = np.flatnonzero(positive & np.concatenate((~positive[1:], [True])))
+    count = min(starts.size, ends.size)
+    starts = starts[:count]
+    ends = ends[:count]
+    peaks = np.asarray(
+        [start + int(np.argmax(data[start : end + 1, 1])) for start, end in zip(starts, ends, strict=True)],
+        dtype=int,
+    )
+
+    def rows(indexes: np.ndarray) -> np.ndarray:
+        if indexes.size == 0:
+            return np.empty((0, 4), dtype=float)
+        return np.column_stack((indexes, data[indexes, 0], data[indexes, 1], np.zeros(indexes.size)))
+
+    peak_rows = rows(peaks)
+    return BoundaryExtrema(
+        extrema=peak_rows.copy(),
+        positive_extrema=peak_rows,
+        starts=rows(starts),
+        ends=rows(ends),
+    )
+
+
+def _superlevel_midpoint_component_counts(
+    value_ranks: np.ndarray,
+    unique_value_count: int,
+) -> np.ndarray:
+    """Count 1-D components above each ascending unique-value midpoint."""
+
+    ranks = np.asarray(value_ranks, dtype=int).reshape(-1)
+    count = max(int(unique_value_count) - 1, 0)
+    result = np.zeros((count,), dtype=int)
+    if count == 0 or ranks.size == 0:
+        return result
+    # For midpoint interval j, a rising edge contributes one component exactly
+    # when rank(previous) <= j < rank(current).  Accumulating these intervals
+    # with a difference array is equivalent to a union-find sweep but remains
+    # inside vectorised NumPy operations.
+    difference = np.zeros((int(unique_value_count),), dtype=int)
+    first_rank = int(ranks[0])
+    if first_rank > 0:
+        difference[0] += 1
+        difference[first_rank] -= 1
+    rising = ranks[1:] > ranks[:-1]
+    if np.any(rising):
+        starts = ranks[:-1][rising]
+        ends = ranks[1:][rising]
+        difference += np.bincount(starts, minlength=int(unique_value_count))
+        difference -= np.bincount(ends, minlength=int(unique_value_count))
+    return np.cumsum(difference)[:count]
+
+
+def _positive_component_count(positive: np.ndarray) -> int:
+    mask = np.asarray(positive, dtype=bool).reshape(-1)
+    if mask.size == 0:
+        return 0
+    return int(mask[0]) + int(np.count_nonzero(mask[1:] & ~mask[:-1]))
+
+
 def _candidate_profile_refinement(
     *,
     structure: Any,
     features: np.ndarray,
     angle_table: np.ndarray,
-    network_patches: tuple[ContactPatch, ...],
+    network_boundaries: BoundaryExtrema,
     anchor_patches: tuple[ContactPatch, ...],
     candidate_margin_m: float,
 ) -> MultiPointContactGeometry | None:
     """Refine only inside neural candidate regions on the fixed native profiles."""
 
     native_y = np.asarray(structure.wheel_interp[:, 1], dtype=float)
-    if native_y.size < 3 or not network_patches:
+    if native_y.size < 3 or network_boundaries.positive_extrema.size == 0:
         return None
     physical = (
         np.asarray(structure.wheel_interp[:, 2], dtype=float)
@@ -499,23 +604,26 @@ def _candidate_profile_refinement(
         + float(features[2])
         + float(features[5])
     )
-    derivative = np.gradient(physical, native_y)
     peak_rows: list[np.ndarray] = []
     start_rows: list[np.ndarray] = []
     end_rows: list[np.ndarray] = []
     used_peaks: set[int] = set()
     anchors = list(anchor_patches)
-    for patch in network_patches:
-        start_index = int(np.clip(patch.start_index, 0, native_y.size - 1))
-        end_index = int(np.clip(patch.end_index, 0, native_y.size - 1))
+    for peak_row, start_row, end_row in zip(
+        network_boundaries.positive_extrema,
+        network_boundaries.starts,
+        network_boundaries.ends,
+        strict=True,
+    ):
+        start_index = int(np.clip(start_row[0], 0, native_y.size - 1))
+        end_index = int(np.clip(end_row[0], 0, native_y.size - 1))
+        candidate_y = float(peak_row[1])
         lo = min(float(native_y[start_index]), float(native_y[end_index])) - candidate_margin_m
         hi = max(float(native_y[start_index]), float(native_y[end_index])) + candidate_margin_m
         if anchors:
             nearest = min(
                 anchors,
-                key=lambda old: abs(
-                    float(old.corrected_rail_point[0] - patch.corrected_rail_point[0])
-                ),
+                key=lambda old: abs(float(old.corrected_rail_point[0]) - candidate_y),
             )
             anchor_y = float(nearest.corrected_rail_point[0])
             lo = min(lo, anchor_y - candidate_margin_m)
@@ -541,7 +649,7 @@ def _candidate_profile_refinement(
 
         def row(index: int) -> np.ndarray:
             return np.array(
-                [float(index), native_y[index], physical[index], derivative[index]],
+                [float(index), native_y[index], physical[index], 0.0],
                 dtype=float,
             )
 
@@ -566,8 +674,9 @@ def _candidate_profile_refinement(
         yaw=float(features[4]),
         lateral=float(features[1]),
         roll=float(features[3]),
+        assume_sorted=True,
     )
-    if len(refined) != len(network_patches):
+    if len(refined) != network_boundaries.positive_extrema.shape[0]:
         return None
     boundaries = BoundaryExtrema(
         extrema=peaks.copy(),

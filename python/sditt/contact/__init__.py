@@ -3,6 +3,8 @@
 from .geometry import (
     BoundaryExtrema,
     ContactPatch,
+    DirectContactGeometry,
+    DirectContactPatch,
     MultiPointContactGeometry,
     PreparedContactProfileGeometry,
     SinglePointContact,
@@ -37,6 +39,8 @@ from .full_case import (
 __all__ = [
     "BoundaryExtrema",
     "ContactPatch",
+    "DirectContactGeometry",
+    "DirectContactPatch",
     "DefaultTrackContactParameters",
     "FullCaseWheelRailContactResult",
     "KalkerTangentialForceResult",

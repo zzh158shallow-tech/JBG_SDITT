@@ -15,6 +15,7 @@ from sditt.models.wrcp_net_a2g import (
     _canonical_grid,
     _field_loss_and_gradient,
     _geometry_from_predicted_field,
+    _topology_matching_threshold,
     _teacher_gap_on_grid,
 )
 from sditt.training_data.network_a import (
@@ -51,6 +52,42 @@ def test_wrcp_net_a2g_loss_and_gradient_shapes() -> None:
     assert np.isfinite(losses[:4]).all()
     assert [value.shape for value in weight_gradients] == [value.shape for value in model.weights]
     assert [value.shape for value in bias_gradients] == [value.shape for value in model.biases]
+
+
+def test_fast_topology_threshold_matches_original_brute_force_search() -> None:
+    rng = np.random.default_rng(20260720)
+    fields = [
+        rng.normal(size=127),
+        np.round(rng.normal(size=127), decimals=1),
+        np.array([-1.0, 1.0, -1.0, 1.0, -1.0]),
+        np.ones((17,), dtype=float),
+    ]
+    for field in fields:
+        for desired_count in (1, 2):
+            sorted_values = np.unique(np.sort(field))
+            thresholds = np.concatenate(
+                (
+                    np.array([0.0]),
+                    sorted_values[:1] - 1.0e-12,
+                    0.5 * (sorted_values[:-1] + sorted_values[1:]),
+                    sorted_values[-1:] + 1.0e-12,
+                )
+            )
+            expected = None
+            for threshold in thresholds:
+                positive = field > float(threshold)
+                count = int(positive[0]) + int(
+                    np.count_nonzero(positive[1:] & ~positive[:-1])
+                )
+                if count == desired_count and (
+                    expected is None or abs(float(threshold)) < abs(expected)
+                ):
+                    expected = float(threshold)
+            actual = _topology_matching_threshold(field, desired_count)
+            if expected is None:
+                assert actual is None
+            else:
+                assert actual == expected
 
 
 def test_true_canonical_gap_field_reconstructs_teacher_geometry() -> None:

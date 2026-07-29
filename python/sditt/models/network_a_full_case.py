@@ -47,6 +47,9 @@ class NetworkAContactGeometryAdapter:
         repo_root: str | Path | None = None,
         trace_output_dir: str | Path | None = None,
         trace_metadata: dict[str, Any] | None = None,
+        trace_mode: str = "selective",
+        trace_low_confidence_threshold: float = 0.95,
+        trace_sample_interval_m: float | None = 1.0,
     ) -> "NetworkAContactGeometryAdapter":
         path = Path(model_path).resolve()
         model, normalization = load_wrcp_net_a2g(path)
@@ -58,6 +61,9 @@ class NetworkAContactGeometryAdapter:
                 trace_output_dir,
                 model_path=path,
                 metadata=trace_metadata,
+                mode=trace_mode,
+                low_confidence_threshold=trace_low_confidence_threshold,
+                sample_interval_m=trace_sample_interval_m,
             )
         )
         residual_heads = load_penetration_residual_heads(path)

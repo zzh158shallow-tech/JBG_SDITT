@@ -44,6 +44,8 @@ def test_network_a_after_preload_stage_switch() -> None:
     assert _network_a_enabled_for_stage("network-a", "Cal")
     assert not _network_a_enabled_for_stage("network-a-after-preload", "Preload")
     assert _network_a_enabled_for_stage("network-a-after-preload", "Cal")
+    assert not _network_a_enabled_for_stage("network-a1-direct-after-preload", "Preload")
+    assert _network_a_enabled_for_stage("network-a1-direct-after-preload", "Cal")
 
 
 def _matlab_validation_enabled() -> bool:

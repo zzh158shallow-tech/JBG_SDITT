@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import pi
 from typing import Any, Mapping
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from sditt.contact.forces import (
     NormalDampingClipDiagnostic,
@@ -16,6 +17,7 @@ from sditt.contact.forces import (
     stripes_normal_force,
 )
 from sditt.contact.geometry import (
+    DirectContactGeometry,
     MultiPointContactGeometry,
     WheelPose2D,
     multi_point_contact_geometry,
@@ -23,6 +25,12 @@ from sditt.contact.geometry import (
 )
 from sditt.profiles.geometry import TrackProfileSet, WheelProfileSet, build_track_profiles, contact_tables, offset_profile_to_track
 from sditt.track.irregularity import TrackIrregularityProfile, TrackIrregularitySample
+from sditt.models.network_b_features import (
+    DIRECT_FEATURE_NAMES,
+    build_network_b_features,
+    direct_network_b_patch_shape_features,
+    network_b_patch_shape_features,
+)
 
 
 _ELLIPTIC_INTEGRAL_PHI = np.linspace(0.0, pi / 2.0, 2001)
@@ -52,8 +60,12 @@ class FullCaseWheelRailContactResult:
     track_profiles: dict[str, TrackProfileSet]
     d0_by_wheelset: dict[str, float]
     relvel_max_by_wheelset: dict[str, dict[str, float]]
-    geometry_by_wheelset_side: dict[str, dict[str, MultiPointContactGeometry | None]]
+    geometry_by_wheelset_side: dict[
+        str,
+        dict[str, MultiPointContactGeometry | DirectContactGeometry | None],
+    ]
     damping_clip_diagnostics: tuple[dict[str, Any], ...] = ()
+    timing: Mapping[str, float] = field(default_factory=dict)
 
 
 def solve_default_wheel_rail_contact(
@@ -73,6 +85,10 @@ def solve_default_wheel_rail_contact(
     use_cal_d0_trace: bool = True,
     track_irregularity: TrackIrregularityProfile | None = None,
     network_a_adapter: Any | None = None,
+    network_b_model: Any | None = None,
+    network_b_shadow_teacher: bool = False,
+    network_b_ood_threshold: float = 4.0,
+    network_b_ood_fallback: str = "traditional",
     network_a_diagnostic_context: Mapping[str, Any] | None = None,
 ) -> FullCaseWheelRailContactResult:
     """Assemble the default rigid-wheel full-case contact route.
@@ -105,8 +121,12 @@ def solve_default_wheel_rail_contact(
     track_profiles: dict[str, TrackProfileSet] = {}
     result_d0_by_wheelset: dict[str, float] = {}
     result_relvel_max_by_wheelset: dict[str, dict[str, float]] = {}
-    geometry_by_wheelset_side: dict[str, dict[str, MultiPointContactGeometry | None]] = {}
+    geometry_by_wheelset_side: dict[
+        str,
+        dict[str, MultiPointContactGeometry | DirectContactGeometry | None],
+    ] = {}
     damping_clip_diagnostics: list[dict[str, Any]] = []
+    nested_timing: dict[str, float] = {}
     wheel_radius_profiles = {"L": wheel_profiles.radius_left, "R": wheel_profiles.radius_right}
     wheel_shape_profiles = {"L": wheel_profiles.left, "R": wheel_profiles.right}
     wheel_angle_profiles = {
@@ -114,6 +134,7 @@ def solve_default_wheel_rail_contact(
         "R": wheel_profiles.contact_angle_right,
     }
 
+    prepared_wheelsets: list[dict[str, Any]] = []
     for wheel_index, wheelset in enumerate(exp_ws):
         mileage = float(front_mileage) - wheel_distances[wheelset]
         irregularity_sample = track_irregularity.sample(mileage) if track_irregularity is not None else None
@@ -146,6 +167,73 @@ def solve_default_wheel_rail_contact(
                 use_cal_d0_trace=use_cal_d0_trace,
             )
         result_d0_by_wheelset[wheelset] = d0
+        prepared_wheelsets.append(
+            {
+                "wheel_index": wheel_index,
+                "wheelset": wheelset,
+                "mileage": mileage,
+                "irregularity_sample": irregularity_sample,
+                "track_profile": track_profile,
+                "pose": pose,
+                "wheel_rate": wheel_rate,
+                "d0": d0,
+            }
+        )
+
+    geometry_overrides: dict[tuple[str, str], DirectContactGeometry] = {}
+    if network_a_adapter is not None:
+        geometry_requests: list[dict[str, Any]] = []
+        geometry_keys: list[tuple[str, str]] = []
+        for prepared in prepared_wheelsets:
+            wheel_index = int(prepared["wheel_index"])
+            wheelset = str(prepared["wheelset"])
+            mileage = float(prepared["mileage"])
+            irregularity_sample = prepared["irregularity_sample"]
+            for side in ("L", "R"):
+                side_patch_index = exp_dummy_rail_side.index(side)
+                contact_index = n_contact_patch * wheel_index + side_patch_index
+                rail_shift_yz = np.asarray(
+                    rail_response.dis_rail[contact_index, 1:3],
+                    dtype=float,
+                ).copy()
+                if irregularity_sample is not None:
+                    rail_shift_yz += np.asarray(
+                        irregularity_sample.rail_displacement_m[side],
+                        dtype=float,
+                    )
+                geometry_keys.append((wheelset, side))
+                geometry_requests.append(
+                    {
+                        "side": side,
+                        "pose": prepared["pose"],
+                        "d0": float(prepared["d0"]),
+                        "rail_shift_yz": rail_shift_yz,
+                        "diagnostic_context": {
+                            **dict(network_a_diagnostic_context or {}),
+                            "front_mileage_m": float(front_mileage),
+                            "actual_mileage_m": mileage,
+                            "wheelset": wheelset,
+                            "side": side,
+                        },
+                    }
+                )
+        predicted_geometries = network_a_adapter.solve_many(
+            geometry_requests,
+            timing=nested_timing,
+        )
+        geometry_overrides.update(
+            zip(geometry_keys, predicted_geometries, strict=True)
+        )
+
+    for prepared in prepared_wheelsets:
+        wheel_index = int(prepared["wheel_index"])
+        wheelset = str(prepared["wheelset"])
+        mileage = float(prepared["mileage"])
+        irregularity_sample = prepared["irregularity_sample"]
+        track_profile = prepared["track_profile"]
+        pose = prepared["pose"]
+        wheel_rate = prepared["wheel_rate"]
+        d0 = float(prepared["d0"])
         result_relvel_max_by_wheelset[wheelset] = {}
         geometry_by_wheelset_side[wheelset] = {}
 
@@ -174,29 +262,24 @@ def solve_default_wheel_rail_contact(
             "Vsdc": {"L": np.zeros((0, 3), dtype=float), "R": np.zeros((0, 3), dtype=float)},
             "Vjsdc": {"L": np.zeros((0, 3), dtype=float), "R": np.zeros((0, 3), dtype=float)},
             "Vgd": {"L": np.zeros((0, 1), dtype=float), "R": np.zeros((0, 1), dtype=float)},
+            "Network_B_Curvature_Inputs": {
+                "L": np.zeros((0, 10), dtype=float),
+                "R": np.zeros((0, 10), dtype=float),
+            },
+            "Network_B_Teacher_Targets": {
+                "L": np.zeros((0, 7), dtype=float),
+                "R": np.zeros((0, 7), dtype=float),
+            },
+            "Network_B_Teacher_Match_Distance_m": {
+                "L": np.zeros((0,), dtype=float),
+                "R": np.zeros((0,), dtype=float),
+            },
+            "Network_B_Teacher_Topology_Match": {"L": True, "R": True},
+            "Network_B_Fallback": {"L": False, "R": False},
         }
 
         for side in ("L", "R"):
-            geometry_override = None
-            if network_a_adapter is not None:
-                side_patch_index = exp_dummy_rail_side.index(side)
-                contact_index = n_contact_patch * wheel_index + side_patch_index
-                rail_shift_yz = np.asarray(rail_response.dis_rail[contact_index, 1:3], dtype=float).copy()
-                if irregularity_sample is not None:
-                    rail_shift_yz += np.asarray(irregularity_sample.rail_displacement_m[side], dtype=float)
-                geometry_override = network_a_adapter.solve(
-                    side=side,
-                    pose=pose,
-                    d0=d0,
-                    rail_shift_yz=rail_shift_yz,
-                    diagnostic_context={
-                        **dict(network_a_diagnostic_context or {}),
-                        "front_mileage_m": float(front_mileage),
-                        "actual_mileage_m": float(mileage),
-                        "wheelset": wheelset,
-                        "side": side,
-                    },
-                )
+            geometry_override = geometry_overrides.get((wheelset, side))
             side_result = _solve_wheel_side_contact(
                 inp_par,
                 vehicle_parameters,
@@ -220,6 +303,10 @@ def solve_default_wheel_rail_contact(
                 ),
                 track_irregularity_sample=irregularity_sample,
                 geometry_override=geometry_override,
+                network_b_model=network_b_model,
+                network_b_shadow_teacher=network_b_shadow_teacher,
+                network_b_ood_threshold=network_b_ood_threshold,
+                network_b_ood_fallback=network_b_ood_fallback,
             )
             con_ws[wheelset]["Normal_Force"][side] = side_result["normal_force"]
             con_ws[wheelset]["Con_wheel_2"][side] = side_result["con_wheel_2"]
@@ -239,6 +326,19 @@ def solve_default_wheel_rail_contact(
             con_ws[wheelset]["Vsdc"][side] = side_result["vsdc"]
             con_ws[wheelset]["Vjsdc"][side] = side_result["vjsdc"]
             con_ws[wheelset]["Vgd"][side] = side_result["vgd"][:, np.newaxis]
+            con_ws[wheelset]["Network_B_Curvature_Inputs"][side] = side_result[
+                "network_b_curvature_inputs"
+            ]
+            con_ws[wheelset]["Network_B_Teacher_Targets"][side] = side_result[
+                "network_b_teacher_targets"
+            ]
+            con_ws[wheelset]["Network_B_Teacher_Match_Distance_m"][side] = side_result[
+                "network_b_teacher_match_distance_m"
+            ]
+            con_ws[wheelset]["Network_B_Teacher_Topology_Match"][side] = bool(
+                side_result["network_b_teacher_topology_match"]
+            )
+            con_ws[wheelset]["Network_B_Fallback"][side] = bool(side_result["network_b_fallback"])
             geometry_by_wheelset_side[wheelset][side] = side_result["geometry"]
             con_ws[wheelset]["Normal_Damping_Clips"] = con_ws[wheelset].get(
                 "Normal_Damping_Clips", {"L": (), "R": ()}
@@ -312,6 +412,7 @@ def solve_default_wheel_rail_contact(
         relvel_max_by_wheelset=result_relvel_max_by_wheelset,
         geometry_by_wheelset_side=geometry_by_wheelset_side,
         damping_clip_diagnostics=tuple(damping_clip_diagnostics),
+        timing=dict(nested_timing),
     )
 
 
@@ -373,7 +474,11 @@ def _solve_wheel_side_contact(
     exp_dummy_rail: list[str],
     previous_relvel_max_by_dummy_rail: Mapping[str, float] | None,
     track_irregularity_sample: TrackIrregularitySample | None,
-    geometry_override: MultiPointContactGeometry | None = None,
+    geometry_override: MultiPointContactGeometry | DirectContactGeometry | None = None,
+    network_b_model: Any | None = None,
+    network_b_shadow_teacher: bool = False,
+    network_b_ood_threshold: float = 4.0,
+    network_b_ood_fallback: str = "traditional",
 ) -> dict[str, Any]:
     rail_profile = np.asarray(track_profile.profile[side], dtype=float)
     if rail_profile.size == 0:
@@ -415,6 +520,7 @@ def _solve_wheel_side_contact(
         dtype=float,
     )
 
+    direct_geometry = isinstance(geometry, DirectContactGeometry)
     for i, patch in enumerate(geometry.patches):
         transforms[i, :, :] = contact_to_track_matrix(pose.yaw, pose.roll, patch.contact_angle)
         transforms_peak[i, :, :] = contact_to_track_matrix(pose.yaw, pose.roll, patch.peak_contact_angle)
@@ -453,7 +559,7 @@ def _solve_wheel_side_contact(
         )
         con_rail_1_peak[i, :] = patch.peak_rail_point
         penetration_peaks[i, :] = np.array(
-            [float(patch.peak_index), float(patch.peak_wheel_point[1]), patch.peak_vertical_penetration, 0.0],
+            [float(getattr(patch, "peak_index", i)), float(patch.peak_wheel_point[1]), patch.peak_vertical_penetration, 0.0],
             dtype=float,
         )
         patch_ids[i] = _judge_contact_patch_id(side, patch.corrected_rail_point[0], track_profile)
@@ -507,8 +613,144 @@ def _solve_wheel_side_contact(
         exp_dummy_rail,
         previous_relvel_max_by_dummy_rail=previous_relvel_max_by_dummy_rail,
     )
+    network_b_curvature_inputs = np.column_stack(
+        (
+            r_yy_w,
+            r_xx_w,
+            r_xx_r,
+            rou,
+            m,
+            n,
+            elastic_permeability,
+            con_a,
+            con_b,
+            con_r,
+        )
+    )
 
-    if str(inp_par["Type_Normal"]) == "STRIPES&ConDamp":
+    vgd = np.abs(float(inp_par["Vlc"]) / 2.0 * (1.0 + con_wheel_2[:, 2] / float(vehicle_parameters["R0"]) * np.cos(pose.yaw)))
+    creepage_inputs = np.column_stack((vsdc[:, 0], vsdc[:, 1], vjsdc[:, 2]))
+    creepage = np.column_stack(
+        (
+            np.divide(creepage_inputs[:, 0], np.maximum(vgd, 1.0e-9)),
+            np.divide(creepage_inputs[:, 1], np.maximum(vgd, 1.0e-9)),
+            np.divide(creepage_inputs[:, 2], np.maximum(vgd, 1.0e-9)),
+        )
+    )
+    network_b_prediction = None
+    if network_b_model is not None:
+        feature_names = tuple(getattr(network_b_model, "feature_names", ()))
+        if direct_geometry and feature_names != DIRECT_FEATURE_NAMES:
+            raise ValueError(
+                "network-A1 Direct requires a wrcp-net-b-direct-force-v2 model artifact"
+            )
+        if direct_geometry:
+            patch_bounds = np.asarray(
+                [
+                    [patch.start_y, patch.end_y, patch.end_y - patch.start_y]
+                    for patch in geometry.patches
+                ],
+                dtype=float,
+            )
+            patch_shape = direct_network_b_patch_shape_features(geometry)
+        else:
+            elastic_y = np.asarray(geometry.elastic_penetration[:, 0], dtype=float)
+            patch_bounds = np.asarray(
+                [
+                    [
+                        elastic_y[patch.start_index],
+                        elastic_y[patch.end_index],
+                        elastic_y[patch.end_index] - elastic_y[patch.start_index],
+                    ]
+                    for patch in geometry.patches
+                ],
+                dtype=float,
+            )
+            patch_shape = network_b_patch_shape_features(geometry)
+        features = build_network_b_features(
+            side=side,
+            pose=pose,
+            d0=d0,
+            patch_ids=patch_ids,
+            con_wheel_2=con_wheel_2,
+            con_wheel_2_peak=con_wheel_2_peak,
+            con_rail_1=con_rail_1,
+            con_rail_1_peak=con_rail_1_peak,
+            con_rel_vel=np.column_stack((vsdc[:, 2], rel_ratio)),
+            vsdc=vsdc,
+            vjsdc=vjsdc,
+            vgd=vgd,
+            patch_bounds=patch_bounds,
+            curvature_inputs=network_b_curvature_inputs,
+            patch_shape=patch_shape,
+            feature_names=feature_names,
+        )
+        in_distribution = np.asarray(
+            network_b_model.in_distribution(features, threshold=network_b_ood_threshold),
+            dtype=bool,
+        )
+        if np.all(in_distribution):
+            network_b_prediction = np.asarray(network_b_model.predict(features), dtype=float)
+            if network_b_prediction.shape != (patch_count, 7):
+                raise ValueError("WRCP-Net B prediction must have shape (patch_count, 7)")
+    network_b_fallback = network_b_model is not None and network_b_prediction is None
+
+    parallel_teacher_targets: np.ndarray | None = None
+    network_b_teacher_match_distance_m = np.zeros((patch_count,), dtype=float)
+    network_b_teacher_topology_match = True
+    if direct_geometry and network_b_shadow_teacher:
+        teacher = _solve_wheel_side_contact(
+            inp_par,
+            vehicle_parameters,
+            track_parameters,
+            wheel_profile,
+            wheel_angles,
+            wheel_radius_profile,
+            rail_response,
+            track_profile,
+            pose,
+            wheel_rate,
+            wheel_index,
+            side,
+            mileage=mileage,
+            d0=d0,
+            exp_dummy_rail=exp_dummy_rail,
+            previous_relvel_max_by_dummy_rail=previous_relvel_max_by_dummy_rail,
+            track_irregularity_sample=track_irregularity_sample,
+            geometry_override=None,
+            network_b_model=None,
+            network_b_shadow_teacher=False,
+            network_b_ood_threshold=network_b_ood_threshold,
+            network_b_ood_fallback="traditional",
+        )
+        teacher_geometry = teacher["geometry"]
+        if teacher_geometry is None or len(teacher_geometry.patches) != patch_count:
+            network_b_teacher_topology_match = False
+            network_b_teacher_match_distance_m = np.full((patch_count,), np.nan, dtype=float)
+        else:
+            cost = np.abs(
+                np.asarray([patch.corrected_rail_point[0] for patch in geometry.patches])[:, None]
+                - np.asarray(
+                    [patch.corrected_rail_point[0] for patch in teacher_geometry.patches]
+                )[None, :]
+            )
+            direct_rows, teacher_columns = linear_sum_assignment(cost)
+            assignment = np.empty((patch_count,), dtype=int)
+            assignment[direct_rows] = teacher_columns
+            network_b_teacher_match_distance_m = cost[np.arange(patch_count), assignment]
+            teacher_normal = np.asarray(teacher["normal_force"], dtype=float)
+            teacher_tangential = np.asarray(teacher["prhxf_t"], dtype=float)
+            parallel_teacher_targets = np.column_stack(
+                (teacher_normal[assignment, 0], teacher_tangential[assignment])
+            )
+
+    traditional_normal_total = None
+    use_stripes = not direct_geometry and str(inp_par["Type_Normal"]) == "STRIPES&ConDamp" and not (
+        network_b_fallback and network_b_ood_fallback == "hertz"
+    )
+    if network_b_ood_fallback not in {"traditional", "hertz"}:
+        raise ValueError("network_b_ood_fallback must be 'traditional' or 'hertz'")
+    if (network_b_prediction is None or network_b_shadow_teacher) and use_stripes:
         elastic = stripes_normal_force(
             wheel_radius_profile,
             np.asarray(track_profile.radius[side], dtype=float),
@@ -537,36 +779,78 @@ def _solve_wheel_side_contact(
             restitution_coefficient=float(inp_par["ConDamp_Coff"]),
             window=normal_damping_window(mileage, str(inp_par["VehicleDir"])),
         )
-        normal_total = normal_force_result.normal_force[:, 0]
+        traditional_normal_total = normal_force_result.normal_force[:, 0]
     else:
-        normal_total = hertz_normal_force(con_wheel_2[:, 4], elastic_permeability, minimum_force=1.0e-3)
+        traditional_normal_total = (
+            None if network_b_prediction is not None else hertz_normal_force(
+                con_wheel_2[:, 4], elastic_permeability, minimum_force=1.0e-3
+            )
+        )
         normal_force_result = None
+    normal_total = (
+        network_b_prediction[:, 0]
+        if network_b_prediction is not None
+        else np.asarray(traditional_normal_total, dtype=float)
+    )
     if patch_count and np.all(np.abs(normal_total) <= 1.0e-9):
         normal_total = np.full((patch_count,), _nominal_contact_force(vehicle_parameters) / patch_count, dtype=float)
-    vgd = np.abs(float(inp_par["Vlc"]) / 2.0 * (1.0 + con_wheel_2[:, 2] / float(vehicle_parameters["R0"]) * np.cos(pose.yaw)))
-    creepage_inputs = np.column_stack((vsdc[:, 0], vsdc[:, 1], vjsdc[:, 2]))
-    creepage = np.column_stack(
-        (
-            np.divide(creepage_inputs[:, 0], np.maximum(vgd, 1.0e-9)),
-            np.divide(creepage_inputs[:, 1], np.maximum(vgd, 1.0e-9)),
-            np.divide(creepage_inputs[:, 2], np.maximum(vgd, 1.0e-9)),
+    if network_b_prediction is not None:
+        network_b_teacher_targets = (
+            np.zeros((0, 7), dtype=float)
+            if parallel_teacher_targets is None
+            else parallel_teacher_targets
         )
-    )
-    tangential = kalker_linear_saturated_creep_force(
-        normal_total,
-        creepage,
-        rolling_radius_sum=rou,
-        wheel_rolling_radius=r_yy_w,
-        m=m,
-        n=n,
-        elastic_modulus=track_parameters.er,
-        poisson_ratio=track_parameters.vr,
-        friction_coefficient=track_parameters.fr,
-        vehicle_speed=float(inp_par["Vlc"]),
-        contact_to_track=transforms,
-    )
-    prhx_t = tangential.saturated_force
-    prhxf_t = tangential.force_track if tangential.force_track is not None else np.zeros((patch_count, 6), dtype=float)
+        if network_b_shadow_teacher and not direct_geometry:
+            teacher_tangential = kalker_linear_saturated_creep_force(
+                np.asarray(traditional_normal_total, dtype=float),
+                creepage,
+                rolling_radius_sum=rou,
+                wheel_rolling_radius=r_yy_w,
+                m=m,
+                n=n,
+                elastic_modulus=track_parameters.er,
+                poisson_ratio=track_parameters.vr,
+                friction_coefficient=track_parameters.fr,
+                vehicle_speed=float(inp_par["Vlc"]),
+                contact_to_track=transforms,
+            )
+            teacher_track = (
+                teacher_tangential.force_track
+                if teacher_tangential.force_track is not None
+                else np.zeros((patch_count, 6), dtype=float)
+            )
+            network_b_teacher_targets = np.column_stack((traditional_normal_total, teacher_track))
+        prhxf_t = network_b_prediction[:, 1:7]
+        prhx_t = prhxf_t[:, :3].copy()
+        prh = prhx_t.copy()
+        rhxs = np.zeros((patch_count, 4), dtype=float)
+        a2 = np.zeros((patch_count,), dtype=float)
+        b2 = np.zeros((patch_count,), dtype=float)
+    else:
+        network_b_teacher_targets = (
+            np.zeros((0, 7), dtype=float)
+            if parallel_teacher_targets is None
+            else parallel_teacher_targets
+        )
+        tangential = kalker_linear_saturated_creep_force(
+            normal_total,
+            creepage,
+            rolling_radius_sum=rou,
+            wheel_rolling_radius=r_yy_w,
+            m=m,
+            n=n,
+            elastic_modulus=track_parameters.er,
+            poisson_ratio=track_parameters.vr,
+            friction_coefficient=track_parameters.fr,
+            vehicle_speed=float(inp_par["Vlc"]),
+            contact_to_track=transforms,
+        )
+        prhx_t = tangential.saturated_force
+        prhxf_t = tangential.force_track if tangential.force_track is not None else np.zeros((patch_count, 6), dtype=float)
+        prh = tangential.linear_force
+        rhxs = tangential.creep_stiffness
+        a2 = tangential.semi_axis_a
+        b2 = tangential.semi_axis_b
 
     normal_force = np.zeros((patch_count, 4), dtype=float)
     for i in range(patch_count):
@@ -586,19 +870,24 @@ def _solve_wheel_side_contact(
         "penetration_peaks": penetration_peaks,
         "con_rel_vel": np.column_stack((vsdc[:, 2], rel_ratio)),
         "con_rel_vel_max": relvel_max,
-        "prh": tangential.linear_force,
+        "prh": prh,
         "prhx_t": prhx_t,
         "prhxf_t": prhxf_t,
         "patch_ids": patch_ids,
-        "rhxs": tangential.creep_stiffness,
+        "rhxs": rhxs,
         "rhlv": creepage,
-        "a2": tangential.semi_axis_a,
-        "b2": tangential.semi_axis_b,
+        "a2": a2,
+        "b2": b2,
         "vjd": vjd,
         "vjd_r": vjd_r,
         "vsdc": vsdc,
         "vjsdc": vjsdc,
         "vgd": vgd,
+        "network_b_curvature_inputs": network_b_curvature_inputs,
+        "network_b_teacher_targets": network_b_teacher_targets,
+        "network_b_teacher_match_distance_m": network_b_teacher_match_distance_m,
+        "network_b_teacher_topology_match": network_b_teacher_topology_match,
+        "network_b_fallback": network_b_fallback,
         "elastic_normal_force": (
             normal_force_result.normal_force if normal_force_result is not None else np.zeros((patch_count, 6), dtype=float)
         ),
@@ -1039,6 +1328,11 @@ def _empty_side_result() -> dict[str, Any]:
         "vsdc": np.zeros((0, 3), dtype=float),
         "vjsdc": np.zeros((0, 3), dtype=float),
         "vgd": np.zeros((0,), dtype=float),
+        "network_b_curvature_inputs": np.zeros((0, 10), dtype=float),
+        "network_b_teacher_targets": np.zeros((0, 7), dtype=float),
+        "network_b_teacher_match_distance_m": np.zeros((0,), dtype=float),
+        "network_b_teacher_topology_match": True,
+        "network_b_fallback": False,
         "elastic_normal_force": np.zeros((0, 6), dtype=float),
         "area_stripes": np.zeros((0,), dtype=float),
         "epsilon": np.zeros((0,), dtype=float),

@@ -19,12 +19,26 @@ __all__ = [
     "load_penetration_residual_heads",
     "train_penetration_residual_heads",
     "NetworkAContactGeometryAdapter",
+    "NetworkA1DirectContactGeometryAdapter",
+    "WRCPNetA1DirectSet",
+    "WRCPNetA1DirectPrediction",
+    "load_wrcp_net_a1_direct",
+    "save_wrcp_net_a1_direct",
 ]
 
 
 def __getattr__(name: str):
     if name == "NetworkAContactGeometryAdapter":
         return getattr(import_module(".network_a_full_case", __name__), name)
+    if name == "NetworkA1DirectContactGeometryAdapter":
+        return getattr(import_module(".network_a1_direct_full_case", __name__), name)
+    if name in {
+        "WRCPNetA1DirectSet",
+        "WRCPNetA1DirectPrediction",
+        "load_wrcp_net_a1_direct",
+        "save_wrcp_net_a1_direct",
+    }:
+        return getattr(import_module(".wrcp_net_a1_direct", __name__), name)
     if name.endswith("A2G") or name.endswith("a2g"):
         return getattr(import_module(".wrcp_net_a2g", __name__), name)
     if name in {
