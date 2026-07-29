@@ -1,0 +1,152 @@
+{
+  "model_path": "outputs/wrcp_net_a1_direct_multiseed_topology_v22_dagger_strict_stabilized/model.npz",
+  "dataset_path": "outputs/network_a_direct_multiseed_full_cal_v5_33seed_transition128/test.npz",
+  "dataset_samples": 10312,
+  "evaluated_cal_samples": 10304,
+  "evaluation_history": "closed-loop-autoregressive",
+  "classification": {
+    "accuracy": 1.0,
+    "macro_f1": 0.3333333333333333,
+    "macro_f1_supported_classes": 1.0,
+    "class_support": [
+      0,
+      10304,
+      0
+    ],
+    "per_class_recall": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "confusion_matrix": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        10304,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  "regression_conditional_on_correct_topology": {
+    "patch_start_y_m": {
+      "samples": 10304,
+      "mae": 1.685734463068138e-05,
+      "p95_absolute_error": 4.330131913434232e-05,
+      "rmse": 2.572692670959066e-05
+    },
+    "patch_end_y_m": {
+      "samples": 10304,
+      "mae": 1.733927092156662e-05,
+      "p95_absolute_error": 4.888908321072361e-05,
+      "rmse": 2.4992119292137753e-05
+    },
+    "corrected_center_y_m": {
+      "samples": 10304,
+      "mae": 2.3376286541176968e-06,
+      "p95_absolute_error": 6.821242819060612e-06,
+      "rmse": 4.567930135607005e-06
+    },
+    "corrected_vertical_penetration_m": {
+      "samples": 10304,
+      "mae": 5.7812835487312265e-09,
+      "p95_absolute_error": 1.601114285544211e-08,
+      "rmse": 8.909295273481086e-09
+    },
+    "peak_vertical_penetration_m": {
+      "samples": 10304,
+      "mae": 8.979016945534077e-09,
+      "p95_absolute_error": 1.5594380903248164e-08,
+      "rmse": 1.0457649962377099e-08
+    },
+    "corrected_contact_angle_rad": {
+      "samples": 10304,
+      "mae": 2.121289316781761e-05,
+      "p95_absolute_error": 4.979036431390676e-05,
+      "rmse": 2.680832724409417e-05
+    },
+    "peak_contact_angle_rad": {
+      "samples": 10304,
+      "mae": 4.818438911907747e-06,
+      "p95_absolute_error": 1.3578084195593408e-05,
+      "rmse": 1.0761003637473394e-05
+    },
+    "shape_moment_1": {
+      "samples": 10304,
+      "mae": 0.0003647422023623804,
+      "p95_absolute_error": 0.000849404578205587,
+      "rmse": 0.00044966030395275067
+    },
+    "shape_moment_1p5": {
+      "samples": 10304,
+      "mae": 0.0003203531933731106,
+      "p95_absolute_error": 0.0007427702696888029,
+      "rmse": 0.00039640372060338987
+    },
+    "shape_moment_2": {
+      "samples": 10304,
+      "mae": 0.00028861701659959845,
+      "p95_absolute_error": 0.0006675353560054138,
+      "rmse": 0.00035966012522757536
+    }
+  },
+  "shape_moment_nrmse_percent": [
+    3.372502108173966,
+    2.9861224720408934,
+    2.730029540884114
+  ],
+  "shape_moment_relative_rmse_percent": [
+    0.07072887912696464,
+    0.07171003396885767,
+    0.07279969331307902
+  ],
+  "strict_guard_failures": {},
+  "hard_decode_failures_with_guards_disabled": 0,
+  "history_continuity": {
+    "preload_to_cal_transition": {
+      "samples": 8,
+      "strict_guard_pass_rate": 1.0,
+      "unguarded_topology_accuracy": 1.0
+    },
+    "closed_loop_depth_buckets": {
+      "depth_0": {
+        "samples": 1168,
+        "unguarded_topology_accuracy": 1.0
+      },
+      "depth_1_to_8": {
+        "samples": 8184,
+        "unguarded_topology_accuracy": 1.0
+      },
+      "depth_9_plus": {
+        "samples": 952,
+        "unguarded_topology_accuracy": 1.0
+      }
+    }
+  },
+  "acceptance": {
+    "topology_accuracy_ge_0p99": true,
+    "supported_class_macro_f1_ge_0p98": true,
+    "no_contact_recall_ge_0p98": null,
+    "double_patch_recall_ge_0p99": null,
+    "center_mae_le_0p10mm": true,
+    "center_p95_le_0p30mm": true,
+    "penetration_mae_le_2um": true,
+    "penetration_p95_le_8um": true,
+    "angle_mae_le_0p002rad": true,
+    "angle_p95_le_0p006rad": true,
+    "shape_moments_nrmse_le_2percent": false,
+    "shape_moments_relative_rmse_le_0p2percent": true,
+    "shape_moments_mae_le_0p0005": true,
+    "shape_moments_p95_le_0p001": true,
+    "shape_moments_physical_gate_passed": true,
+    "hard_decode_failures_eq_0": true
+  }
+}

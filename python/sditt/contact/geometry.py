@@ -35,6 +35,24 @@ class PreparedWheelTraceProfile:
 
 
 @dataclass(frozen=True)
+class PreparedContactProfileGeometry:
+    """Pose-dependent wheel/rail interpolants before contact-point search."""
+
+    wheel_interp: np.ndarray
+    rail_interp: np.ndarray
+    contact_angles: np.ndarray
+    wheel_profile_lateral: np.ndarray
+
+
+@dataclass(frozen=True)
+class PreparedRailProfileInterpolator:
+    """Sorted fixed rail profile and its reusable cubic interpolator."""
+
+    rail: np.ndarray
+    spline: CubicSpline | None
+
+
+@dataclass(frozen=True)
 class SinglePointContact:
     """One Hertz-style normal contact geometry result."""
 
@@ -66,6 +84,46 @@ class ContactPatch:
     corrected_vertical_penetration: float
     corrected_normal_penetration: float
     contact_angle: float
+
+
+@dataclass(frozen=True)
+class DirectContactPatch:
+    """One final contact patch predicted without a reconstructed profile grid.
+
+    ``shape_moments`` contains the dimensionless first, 1.5-order and second
+    moments of the positive penetration distribution, normalized by patch
+    width and peak penetration.  They let a force surrogate consume smooth
+    patch-shape information without depending on a 501/1001-point grid.
+    """
+
+    start_y: float
+    end_y: float
+    peak_wheel_point: np.ndarray
+    peak_rail_point: np.ndarray
+    corrected_wheel_point: np.ndarray
+    corrected_rail_point: np.ndarray
+    wheel_profile_lateral: float
+    peak_vertical_penetration: float
+    peak_normal_penetration: float
+    peak_contact_angle: float
+    corrected_vertical_penetration: float
+    corrected_normal_penetration: float
+    contact_angle: float
+    shape_moments: np.ndarray
+
+
+@dataclass(frozen=True)
+class DirectContactGeometry:
+    """Final patch geometry produced directly by WRCP-Net A1 Direct Set.
+
+    Unlike :class:`MultiPointContactGeometry`, this contract deliberately has
+    no interpolated profiles, penetration field, or sample indexes.
+    """
+
+    has_contact: bool
+    patches: tuple[DirectContactPatch, ...]
+    topology_probability: np.ndarray
+    in_distribution: bool = True
 
 
 @dataclass(frozen=True)
@@ -231,12 +289,18 @@ def multi_point_contact_geometry(
     point to the weighted quasi-elastic center of its interval.
     """
 
-    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose, dlb=dlb)
-    wheel_interp, rail_interp, angles, wheel_lateral = _overlap_interpolants(
-        trace,
+    prepared = prepare_contact_profile_geometry(
+        wheel_profile,
+        contact_angle_table,
         rail_profile,
+        pose=pose,
         min_overlap_margin=min_overlap_margin,
+        dlb=dlb,
     )
+    wheel_interp = prepared.wheel_interp
+    rail_interp = prepared.rail_interp
+    angles = prepared.contact_angles
+    wheel_lateral = prepared.wheel_profile_lateral
     if wheel_interp.size == 0:
         empty = np.empty((0, 2), dtype=float)
         boundaries = extreme_boundary(empty)
@@ -272,6 +336,43 @@ def multi_point_contact_geometry(
         boundaries=boundaries,
         patches=patches,
     )
+
+
+def prepare_contact_profile_geometry(
+    wheel_profile: np.ndarray,
+    contact_angle_table: np.ndarray,
+    rail_profile: np.ndarray,
+    *,
+    pose: WheelPose2D | None = None,
+    min_overlap_margin: float = 0.0,
+    dlb: float | None = None,
+    prepared_rail: PreparedRailProfileInterpolator | None = None,
+) -> PreparedContactProfileGeometry:
+    """Build native profile interpolants without searching for contact patches."""
+
+    trace = trace_wheel_profile(wheel_profile, contact_angle_table, pose, dlb=dlb)
+    wheel_interp, rail_interp, angles, wheel_lateral = _overlap_interpolants(
+        trace,
+        rail_profile,
+        min_overlap_margin=min_overlap_margin,
+        prepared_rail=prepared_rail,
+    )
+    return PreparedContactProfileGeometry(
+        wheel_interp=wheel_interp,
+        rail_interp=rail_interp,
+        contact_angles=angles,
+        wheel_profile_lateral=wheel_lateral,
+    )
+
+
+def prepare_rail_profile_interpolator(rail_profile: np.ndarray) -> PreparedRailProfileInterpolator:
+    """Precompute the pose-independent rail sorting and cubic coefficients."""
+
+    rail = _sort_points(rail_profile)
+    unique_y, unique_index = np.unique(rail[:, 0], return_index=True)
+    unique_z = rail[unique_index, 1]
+    spline = CubicSpline(unique_y, unique_z) if unique_y.size >= 4 else None
+    return PreparedRailProfileInterpolator(rail=rail, spline=spline)
 
 
 def extreme_boundary(ver_dis: np.ndarray, opt: str = "max") -> BoundaryExtrema:
@@ -341,17 +442,24 @@ def quasi_elastic_correction(
     lateral: float = 0.0,
     roll: float = 0.0,
     theta: float = 2e-5,
+    assume_sorted: bool = False,
 ) -> tuple[ContactPatch, ...]:
     """Apply MATLAB ``Quasi_Elastic_Correction.m`` to candidate patches."""
 
     if positive_peaks.size == 0:
         return ()
 
-    elastic = _sort_points(elastic_penetration)
+    elastic = np.asarray(elastic_penetration, dtype=float) if assume_sorted else _sort_points(elastic_penetration)
     wheel_raw = np.asarray(wheel_interp, dtype=float)
-    wheel_order = np.argsort(wheel_raw[:, 1], kind="mergesort") if wheel_raw.size else np.array([], dtype=int)
+    wheel_order = (
+        np.arange(wheel_raw.shape[0], dtype=int)
+        if assume_sorted and wheel_raw.size
+        else np.argsort(wheel_raw[:, 1], kind="mergesort")
+        if wheel_raw.size
+        else np.array([], dtype=int)
+    )
     wheel = wheel_raw[wheel_order] if wheel_raw.size else wheel_raw.reshape(0, 3)
-    rail = _sort_points(rail_interp)
+    rail = np.asarray(rail_interp, dtype=float) if assume_sorted else _sort_points(rail_interp)
     angles_raw = np.asarray(contact_angles, dtype=float)
     angles = angles_raw[wheel_order] if wheel_order.size else angles_raw
     if wheel_profile_lateral is not None:
@@ -360,7 +468,7 @@ def quasi_elastic_correction(
     else:
         wheel_lateral = wheel[:, 1]
     if contact_angle_table is not None:
-        angle_profile = _sort_points(contact_angle_table)
+        angle_profile = np.asarray(contact_angle_table, dtype=float) if assume_sorted else _sort_points(contact_angle_table)
     else:
         angle_profile = _sort_points(np.column_stack((wheel_lateral, angles)))
     wheel_to_track = _wheelset_orientation(roll, yaw)
@@ -546,8 +654,9 @@ def _overlap_interpolants(
     rail_profile: np.ndarray,
     *,
     min_overlap_margin: float,
+    prepared_rail: PreparedRailProfileInterpolator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    rail = _sort_points(rail_profile)
+    rail = _sort_points(rail_profile) if prepared_rail is None else prepared_rail.rail
     if trace.track_points.size == 0 or rail.size == 0:
         return (
             np.empty((0, 3), dtype=float),
@@ -580,13 +689,22 @@ def _overlap_interpolants(
     wheel = trace.track_points[mask][sort_index]
     angles = trace.contact_angles[mask][sort_index]
     wheel_lateral = trace.wheel_lateral[mask][sort_index]
-    rail_z = _matlab_rail_interp(rail, wheel[:, 1])
+    rail_z = _matlab_rail_interp(
+        rail,
+        wheel[:, 1],
+        spline=None if prepared_rail is None else prepared_rail.spline,
+    )
     rail_interp = np.column_stack((wheel[:, 1], rail_z))
     return wheel, rail_interp, angles, wheel_lateral
 
 
-def _matlab_rail_interp(rail: np.ndarray, y: np.ndarray) -> np.ndarray:
-    spline_z = _spline_interp(rail[:, 0], rail[:, 1], y)
+def _matlab_rail_interp(
+    rail: np.ndarray,
+    y: np.ndarray,
+    *,
+    spline: CubicSpline | None = None,
+) -> np.ndarray:
+    spline_z = _spline_interp(rail[:, 0], rail[:, 1], y) if spline is None else spline(y)
     linear_z = np.interp(y, rail[:, 0], rail[:, 1])
     return np.where(spline_z > 0.6 + 8e-3, linear_z, spline_z)
 

@@ -8,12 +8,14 @@ import time
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
 from sditt.config import DefaultOperatingCase, RailLayout
 from sditt.simulation import (
+    CoupledIterationSettings,
+    FullCaseAcceptedContactSnapshot,
     FullCaseProgressEvent,
     FullCaseProfileSnapshot,
     FullCaseSideProfileSnapshot,
@@ -34,6 +36,9 @@ from sditt.track import (
 DEFAULT_OUTPUT_DIR = Path("python/outputs/full_case_short_run")
 DEFAULT_ABS_TOLERANCE = 1.0e-6
 DEFAULT_REL_TOLERANCE = 1.0e-4
+DEFAULT_NETWORK_A_MODEL = Path("outputs/wrcp_net_a2g/model.npz")
+DEFAULT_NETWORK_A1_DIRECT_MODEL = Path("outputs/wrcp_net_a1_direct/model.npz")
+DEFAULT_NETWORK_B_MODEL = Path("outputs/wrcp_net_b/model.npz")
 _PATCH_FORCE_COLORS = (
     "#1f77b4",
     "#ff7f0e",
@@ -69,6 +74,145 @@ class ComparisonMetric:
     status: str
 
 
+class _ContactKeyDataRecorder:
+    """Stream accepted-step wheel/rail forces and contact locations to one CSV."""
+
+    _HEADER = (
+        "stage,step,time_s,dt_s,front_mileage_m,iterations,wheelset,wheelset_mileage_m,"
+        "side,contact_patch_index,patch_id,dummy_rail,force_on_wheel_x_N,"
+        "force_on_wheel_y_N,force_on_wheel_z_N,resultant_force_on_wheel_N,"
+        "normal_force_N,wheel_contact_x_m,wheel_contact_y_m,wheel_contact_z_m,"
+        "rail_contact_x_m,rail_contact_y_m,rail_contact_z_m,contact_angle_rad,"
+        "vertical_penetration_m,normal_penetration_m,network_b_fallback\n"
+    )
+
+    def __init__(self, path: str | Path, *, append: bool = False) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        has_content = append and self.path.is_file() and self.path.stat().st_size > 0
+        self._handle = self.path.open("a" if append else "w", encoding="utf-8")
+        if not has_content:
+            self._handle.write(self._HEADER)
+        self._accepted_steps = 0
+
+    def __call__(self, snapshot: FullCaseAcceptedContactSnapshot) -> None:
+        contact = snapshot.wheel_rail_contact
+        for wheelset, pose in snapshot.wheel_pose_by_wheelset.items():
+            wheelset_contact = contact.con_ws.get(wheelset, {})
+            if not isinstance(wheelset_contact, dict):
+                continue
+            mileage = float(wheelset_contact.get("Mileage", snapshot.front_mileage))
+            d0 = float(contact.d0_by_wheelset.get(wheelset, 0.0))
+            for side in ("L", "R"):
+                fallback_container = wheelset_contact.get("Network_B_Fallback", {})
+                network_b_fallback = bool(
+                    fallback_container.get(side, False)
+                    if isinstance(fallback_container, dict)
+                    else False
+                )
+                normal = _contact_side_array(wheelset_contact, "Normal_Force", side, columns=4)
+                if normal.shape[0] == 0:
+                    continue
+                tangential = _contact_side_array(wheelset_contact, "Prhxf_T", side, columns=6)
+                wheel_local = _contact_side_array(
+                    wheelset_contact,
+                    "Con_wheel_2_full",
+                    side,
+                    columns=6,
+                )
+                rail_points = _contact_side_array(wheelset_contact, "Con_rail_1", side, columns=2)
+                wheel_points = _wheel_contact_points_in_track(wheel_local, pose, d0)
+                for patch_index in range(normal.shape[0]):
+                    patch_id = int(round(float(normal[patch_index, 3])))
+                    dummy_rail = (
+                        snapshot.dummy_rail_labels[patch_id - 1]
+                        if 0 < patch_id <= len(snapshot.dummy_rail_labels)
+                        else ""
+                    )
+                    tangent = _array_row_or_zeros(tangential, patch_index, 6)
+                    wheel_point = _array_row_or_nan(wheel_points, patch_index, 2)
+                    rail_point = _array_row_or_nan(rail_points, patch_index, 2)
+                    wheel_full = _array_row_or_nan(wheel_local, patch_index, 6)
+                    force_x = -float(tangent[0])
+                    force_y = -float(tangent[1]) - float(normal[patch_index, 1])
+                    force_z = -float(tangent[2]) - float(normal[patch_index, 2])
+                    resultant = float(np.linalg.norm((force_x, force_y, force_z)))
+                    self._handle.write(
+                        f"{snapshot.stage},{snapshot.step_index},{snapshot.time:.17g},{snapshot.dt:.17g},"
+                        f"{snapshot.front_mileage:.17g},{snapshot.iterations},{wheelset},{mileage:.17g},"
+                        f"{side},{patch_index + 1},{patch_id},{dummy_rail},{force_x:.17g},{force_y:.17g},"
+                        f"{force_z:.17g},{resultant:.17g},{float(normal[patch_index, 0]):.17g},"
+                        f"{mileage:.17g},{wheel_point[0]:.17g},{wheel_point[1]:.17g},"
+                        f"{mileage:.17g},{rail_point[0]:.17g},{rail_point[1]:.17g},"
+                        f"{wheel_full[5]:.17g},{wheel_full[3]:.17g},{wheel_full[4]:.17g},"
+                        f"{str(network_b_fallback).lower()}\n"
+                    )
+        self._accepted_steps += 1
+        if self._accepted_steps % 100 == 0:
+            self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.flush()
+        self._handle.close()
+
+    def __enter__(self) -> "_ContactKeyDataRecorder":
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
+def _contact_side_array(
+    wheelset_contact: dict[str, Any],
+    key: str,
+    side: str,
+    *,
+    columns: int,
+) -> np.ndarray:
+    container = wheelset_contact.get(key, {})
+    value = container.get(side, ()) if isinstance(container, dict) else ()
+    array = np.asarray(value, dtype=float)
+    if array.size == 0:
+        return np.zeros((0, columns), dtype=float)
+    reshaped = array.reshape((-1, array.shape[-1]))
+    if reshaped.shape[1] < columns:
+        padded = np.zeros((reshaped.shape[0], columns), dtype=float)
+        padded[:, : reshaped.shape[1]] = reshaped
+        return padded
+    return reshaped[:, :columns]
+
+
+def _wheel_contact_points_in_track(wheel_local: np.ndarray, pose: Any, d0: float) -> np.ndarray:
+    if wheel_local.shape[0] == 0:
+        return np.zeros((0, 2), dtype=float)
+    roll = float(pose.roll)
+    yaw = float(pose.yaw)
+    orientation = np.array(
+        [
+            [np.cos(yaw), np.sin(yaw), 0.0],
+            [-np.cos(roll) * np.sin(yaw), np.cos(roll) * np.cos(yaw), np.sin(roll)],
+            [np.sin(roll) * np.sin(yaw), -np.sin(roll) * np.cos(yaw), np.cos(roll)],
+        ],
+        dtype=float,
+    )
+    track = wheel_local[:, :3] @ orientation + np.array([0.0, float(pose.lateral), 0.0])
+    result = track[:, 1:3].copy()
+    result[:, 1] += float(pose.vertical) + float(d0)
+    return result
+
+
+def _array_row_or_zeros(array: np.ndarray, row: int, columns: int) -> np.ndarray:
+    if row >= array.shape[0]:
+        return np.zeros((columns,), dtype=float)
+    return np.asarray(array[row, :columns], dtype=float)
+
+
+def _array_row_or_nan(array: np.ndarray, row: int, columns: int) -> np.ndarray:
+    if row >= array.shape[0]:
+        return np.full((columns,), np.nan, dtype=float)
+    return np.asarray(array[row, :columns], dtype=float)
+
+
 def build_python_short_run_snapshot(
     *,
     cut_freq: float | None = 50.0,
@@ -76,6 +220,7 @@ def build_python_short_run_snapshot(
     n_steps_per_stage: int = 1,
     use_sparse: bool = True,
     use_matlab_mileage_endpoints: bool = False,
+    stage_end_mileage: Mapping[str, float] | None = None,
     preload_cache_dir: str | Path | None = None,
     history_retention_steps: int | None = 256,
     checkpoint_dir: str | Path | None = None,
@@ -83,9 +228,22 @@ def build_python_short_run_snapshot(
     resume_checkpoint: bool = False,
     resume_checkpoint_path: str | Path | None = None,
     progress_callback: Any = None,
+    accepted_contact_callback: Any = None,
     rail_layout: RailLayout = "interval",
     track_irregularity: TrackIrregularityModel = "none",
     irregularity_seed: int = 20260716,
+    contact_geometry_mode: str = "traditional",
+    network_a_model_path: str | Path = DEFAULT_NETWORK_A_MODEL,
+    network_a_trace_dir: str | Path | None = None,
+    network_a_trace_mode: str = "selective",
+    network_a_trace_low_confidence: float = 0.95,
+    network_a_trace_sample_interval_m: float | None = 1.0,
+    network_a_force_mode: str = "traditional",
+    network_b_model_path: str | Path = DEFAULT_NETWORK_B_MODEL,
+    network_b_ood_threshold: float = 4.0,
+    network_b_ood_fallback: str = "traditional",
+    contact_force_tolerance: float = 2.5e-3,
+    snapshot_history_limit: int | None = None,
 ) -> dict[str, Any]:
     """Run the Python full-case driver and serialize key validation quantities."""
 
@@ -94,6 +252,7 @@ def build_python_short_run_snapshot(
         dt=dt,
         n_steps_per_stage=n_steps_per_stage,
         use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
+        stage_end_mileage=stage_end_mileage,
         use_sparse=use_sparse,
         preload_cache_dir=preload_cache_dir,
         history_retention_steps=history_retention_steps,
@@ -102,16 +261,106 @@ def build_python_short_run_snapshot(
         resume_checkpoint=resume_checkpoint,
         resume_checkpoint_path=resume_checkpoint_path,
         progress_callback=progress_callback,
+        accepted_contact_callback=accepted_contact_callback,
         track_irregularity=TrackIrregularitySettings(model=track_irregularity, seed=irregularity_seed),
+        contact_geometry_mode=contact_geometry_mode,
+        network_a_model_path=network_a_model_path,
+        network_a_trace_dir=network_a_trace_dir,
+        network_a_trace_mode=network_a_trace_mode,
+        network_a_trace_low_confidence=network_a_trace_low_confidence,
+        network_a_trace_sample_interval_m=network_a_trace_sample_interval_m,
+        network_a_force_mode=network_a_force_mode,
+        network_b_model_path=network_b_model_path,
+        network_b_ood_threshold=network_b_ood_threshold,
+        network_b_ood_fallback=network_b_ood_fallback,
+        iteration_settings=CoupledIterationSettings(
+            max_iterations=11,
+            force_tolerance=contact_force_tolerance,
+            absolute_force_tolerance=1.0e-6,
+            relaxation=1.0,
+        ),
     )
     result = run_default_full_case_driver(
         settings=settings,
         operating_case=DefaultOperatingCase(rail_layout=rail_layout),
     )
-    return snapshot_from_run_result(result)
+    return snapshot_from_run_result(
+        result,
+        history_limit=snapshot_history_limit,
+    )
 
 
-def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]:
+def run_full_case_contact_key_data(
+    output_dir: str | Path,
+    *,
+    cut_freq: float | None = None,
+    dt: float = 1.0e-4,
+    n_steps_per_stage: int = 1,
+    use_sparse: bool = True,
+    use_matlab_mileage_endpoints: bool = False,
+    history_retention_steps: int | None = 1,
+    progress_callback: Any = None,
+    rail_layout: RailLayout = "interval",
+    track_irregularity: TrackIrregularityModel = "none",
+    irregularity_seed: int = 20260716,
+    contact_geometry_mode: str = "network-a-after-preload",
+    network_a_model_path: str | Path = DEFAULT_NETWORK_A_MODEL,
+    network_a_force_mode: str = "traditional",
+    contact_force_tolerance: float = 2.5e-3,
+) -> Path:
+    """Run the model while writing only accepted-step contact key data.
+
+    Network A runtime tracing, progress files, validation snapshots, and Network B
+    are not configured here. Passing ``network_a_force_mode='network-b'`` is
+    intentionally rejected because this production-oriented path is for a fixed
+    deterministic force law, not a surrogate with an out-of-distribution fallback.
+    """
+
+    if network_a_force_mode == "network-b":
+        raise ValueError("contact-key-data-only mode does not permit Network B")
+    output_path = Path(output_dir)
+    csv_path = output_path / "wheel_rail_contact_key_data.csv"
+    settings = FullDefaultCaseSettings(
+        cut_freq=cut_freq,
+        dt=dt,
+        n_steps_per_stage=n_steps_per_stage,
+        use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
+        use_sparse=use_sparse,
+        history_retention_steps=history_retention_steps,
+        progress_callback=progress_callback,
+        accepted_contact_callback=None,
+        track_irregularity=TrackIrregularitySettings(
+            model=track_irregularity,
+            seed=irregularity_seed,
+        ),
+        contact_geometry_mode=contact_geometry_mode,
+        network_a_model_path=network_a_model_path,
+        network_a_trace_dir=None,
+        network_a_force_mode=network_a_force_mode,
+        network_b_shadow_teacher=False,
+        iteration_settings=CoupledIterationSettings(
+            max_iterations=11,
+            force_tolerance=contact_force_tolerance,
+            absolute_force_tolerance=1.0e-6,
+            relaxation=1.0,
+        ),
+    )
+    with _ContactKeyDataRecorder(csv_path) as recorder:
+        settings = replace(settings, accepted_contact_callback=recorder)
+        run_default_full_case_driver(
+            settings=settings,
+            operating_case=DefaultOperatingCase(rail_layout=rail_layout),
+        )
+    return csv_path
+
+
+def snapshot_from_run_result(
+    result: FullDefaultCaseRunResult,
+    *,
+    history_limit: int | None = None,
+) -> dict[str, Any]:
+    if history_limit is not None and history_limit <= 0:
+        raise ValueError("history_limit must be positive")
     preparation = result.preparation
     irregularity = _track_irregularity_snapshot(preparation)
     return {
@@ -120,6 +369,36 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
         "settings": {
             "rail_layout": preparation.operating_case.rail_layout,
             "track_irregularity": irregularity,
+            "contact_geometry_mode": preparation.settings.contact_geometry_mode,
+            "network_a_model_path": (
+                None
+                if preparation.network_a_contact_adapter is None
+                else str(preparation.network_a_contact_adapter.model_path)
+            ),
+            "network_a_trace_dir": (
+                None
+                if preparation.network_a_contact_adapter is None
+                or preparation.network_a_contact_adapter.trace_writer is None
+                else str(preparation.network_a_contact_adapter.trace_writer.output_dir)
+            ),
+            "network_a_trace_mode": preparation.settings.network_a_trace_mode,
+            "network_a_trace_low_confidence": (
+                preparation.settings.network_a_trace_low_confidence
+            ),
+            "network_a_trace_sample_interval_m": (
+                preparation.settings.network_a_trace_sample_interval_m
+            ),
+            "network_a_force_mode": preparation.settings.network_a_force_mode,
+            "network_b_enabled": preparation.network_b_force_model is not None,
+            "network_b_fallback_active": preparation.network_b_force_model is not None,
+            "network_b_model_path": (
+                None
+                if preparation.network_b_model_path is None
+                else str(preparation.network_b_model_path)
+            ),
+            "network_b_ood_threshold": preparation.settings.network_b_ood_threshold,
+            "network_b_ood_fallback": preparation.settings.network_b_ood_fallback,
+            "contact_force_tolerance": preparation.settings.iteration_settings.force_tolerance,
             "cut_freq": preparation.settings.cut_freq,
             "dt": preparation.settings.dt,
             "n_steps_per_stage": preparation.settings.n_steps_per_stage,
@@ -161,7 +440,10 @@ def snapshot_from_run_result(result: FullDefaultCaseRunResult) -> dict[str, Any]
             "missing_stages": [stage.name for stage in preparation.missing_stages],
             "track_irregularity": irregularity,
         },
-        "stages": [_stage_snapshot(stage) for stage in result.stages],
+        "stages": [
+            _stage_snapshot(stage, history_limit=history_limit)
+            for stage in result.stages
+        ],
         "timing": _timing_snapshot(result),
     }
 
@@ -192,9 +474,11 @@ def write_full_case_short_run_report(
     n_steps_per_stage: int = 1,
     use_sparse: bool = True,
     use_matlab_mileage_endpoints: bool = False,
+    stage_end_mileage: Mapping[str, float] | None = None,
     plot_progress: bool = False,
     plot_every: int = 1,
     save_progress: bool = False,
+    save_contact_key_data: bool = False,
     preload_cache_dir: str | Path | None = None,
     history_retention_steps: int | None = 256,
     checkpoint_dir: str | Path | None = None,
@@ -208,6 +492,18 @@ def write_full_case_short_run_report(
     rail_layout: RailLayout = "interval",
     track_irregularity: TrackIrregularityModel = "none",
     irregularity_seed: int = 20260716,
+    contact_geometry_mode: str = "traditional",
+    network_a_model_path: str | Path = DEFAULT_NETWORK_A_MODEL,
+    network_a_trace_dir: str | Path | None = None,
+    network_a_trace_mode: str = "selective",
+    network_a_trace_low_confidence: float = 0.95,
+    network_a_trace_sample_interval_m: float | None = 1.0,
+    network_a_force_mode: str = "traditional",
+    network_b_model_path: str | Path = DEFAULT_NETWORK_B_MODEL,
+    network_b_ood_threshold: float = 4.0,
+    network_b_ood_fallback: str = "traditional",
+    contact_force_tolerance: float = 2.5e-3,
+    snapshot_history_limit: int | None = None,
 ) -> tuple[Path, Path]:
     """Write a Python snapshot and Markdown error report for a short full-case run."""
 
@@ -216,23 +512,49 @@ def write_full_case_short_run_report(
     progress_writer = progress_recorder or (
         _ProgressRecorder(every=plot_every) if plot_progress or save_progress else None
     )
-    python_snapshot = build_python_short_run_snapshot(
-        cut_freq=cut_freq,
-        dt=dt,
-        n_steps_per_stage=n_steps_per_stage,
-        use_sparse=use_sparse,
-        use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
-        preload_cache_dir=preload_cache_dir,
-        history_retention_steps=history_retention_steps,
-        checkpoint_dir=checkpoint_dir,
-        save_checkpoints=save_checkpoints,
-        resume_checkpoint=resume_checkpoint,
-        resume_checkpoint_path=resume_checkpoint_path,
-        progress_callback=progress_writer,
-        rail_layout=rail_layout,
-        track_irregularity=track_irregularity,
-        irregularity_seed=irregularity_seed,
+    key_data_recorder = (
+        _ContactKeyDataRecorder(
+            output_path / "wheel_rail_contact_key_data.csv",
+            append=resume_checkpoint,
+        )
+        if save_contact_key_data
+        else None
     )
+    try:
+        python_snapshot = build_python_short_run_snapshot(
+            cut_freq=cut_freq,
+            dt=dt,
+            n_steps_per_stage=n_steps_per_stage,
+            use_sparse=use_sparse,
+            use_matlab_mileage_endpoints=use_matlab_mileage_endpoints,
+            stage_end_mileage=stage_end_mileage,
+            preload_cache_dir=preload_cache_dir,
+            history_retention_steps=history_retention_steps,
+            checkpoint_dir=checkpoint_dir,
+            save_checkpoints=save_checkpoints,
+            resume_checkpoint=resume_checkpoint,
+            resume_checkpoint_path=resume_checkpoint_path,
+            progress_callback=progress_writer,
+            accepted_contact_callback=key_data_recorder,
+            rail_layout=rail_layout,
+            track_irregularity=track_irregularity,
+            irregularity_seed=irregularity_seed,
+            contact_geometry_mode=contact_geometry_mode,
+            network_a_model_path=network_a_model_path,
+            network_a_trace_dir=network_a_trace_dir,
+            network_a_trace_mode=network_a_trace_mode,
+            network_a_trace_low_confidence=network_a_trace_low_confidence,
+            network_a_trace_sample_interval_m=network_a_trace_sample_interval_m,
+            network_a_force_mode=network_a_force_mode,
+            network_b_model_path=network_b_model_path,
+            network_b_ood_threshold=network_b_ood_threshold,
+            network_b_ood_fallback=network_b_ood_fallback,
+            contact_force_tolerance=contact_force_tolerance,
+            snapshot_history_limit=snapshot_history_limit,
+        )
+    finally:
+        if key_data_recorder is not None:
+            key_data_recorder.close()
     snapshot_path = output_path / "python_snapshot.json"
     snapshot_path.write_text(_json_dumps(python_snapshot), encoding="utf-8")
 
@@ -292,7 +614,7 @@ def build_full_case_short_run_report(
         "",
         "## Stage Summary",
         "",
-        "| stage | output rows | final mileage | final iterations | final normal error | final normal+tangent error |",
+        "| stage | accepted steps | final mileage | final iterations | final normal error | final normal+tangent error |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for stage in python_snapshot["stages"]:
@@ -301,7 +623,7 @@ def build_full_case_short_run_report(
         lines.append(
             "| {stage} | {row_count} | {mileage:.12g} | {iterations} | {normal:.6g} | {normal_tan:.6g} |".format(
                 stage=stage["name"],
-                row_count=len(rows),
+                row_count=int(stage.get("accepted_step_count", len(rows))),
                 mileage=float(final.get("front_mileage", 0.0)),
                 iterations=int(final.get("iterations", 0)),
                 normal=float(final.get("normal_error", 0.0)),
@@ -416,13 +738,32 @@ def _stage_names(snapshot: dict[str, Any]) -> tuple[str, ...]:
     return tuple(str(stage.get("name", "")) for stage in _snapshot_stages(snapshot) if stage.get("name"))
 
 
-def _stage_snapshot(stage: Any) -> dict[str, Any]:
+def _stage_snapshot(
+    stage: Any,
+    *,
+    history_limit: int | None = None,
+) -> dict[str, Any]:
+    iteration_records = tuple(stage.iteration_records)
+    output_rows = tuple(stage.output_rows)
+    convergence_history = np.asarray(stage.convergence_history)
+    output_table = np.asarray(stage.output_table)
+    if history_limit is not None:
+        iteration_records = iteration_records[-history_limit:]
+        output_rows = output_rows[-history_limit:]
+        convergence_history = convergence_history[-history_limit:]
+        output_table = output_table[-history_limit:]
     return {
         "name": stage.stage,
-        "convergence_history": _array_payload(stage.convergence_history),
-        "iteration_diagnostics": [_iteration_snapshot(record) for record in stage.iteration_records],
-        "output_table": _array_payload(stage.output_table),
-        "output_rows": [_output_row_snapshot(row) for row in stage.output_rows],
+        "accepted_step_count": len(stage.output_rows),
+        "iteration_record_count": len(stage.iteration_records),
+        "snapshot_history_limit": history_limit,
+        "convergence_history": _array_payload(convergence_history),
+        "iteration_diagnostics": [
+            _iteration_snapshot(record)
+            for record in iteration_records
+        ],
+        "output_table": _array_payload(output_table),
+        "output_rows": [_output_row_snapshot(row) for row in output_rows],
         "timing": {str(key): float(value) for key, value in getattr(stage.history, "timing", {}).items()},
     }
 
@@ -853,6 +1194,8 @@ class _ProgressRecorder:
                 )
         svg_path.write_text(self.svg(events), encoding="utf-8")
         self._write_damping_clip_diagnostics(output_dir, events)
+        _write_wheel_rail_force_csv(output_dir / "wheel_rail_forces.csv", events)
+        _write_contact_patch_force_csv(output_dir / "contact_patch_forces.csv", events)
         return csv_path, svg_path
 
     def _write_damping_clip_diagnostics(self, output_dir: Path, events: tuple[FullCaseProgressEvent, ...]) -> None:
@@ -1123,6 +1466,107 @@ def _patch_force_labels(events: Iterable[FullCaseProgressEvent]) -> tuple[str, .
     if patch_count > 0:
         return tuple(f"patch-{index + 1}" for index in range(patch_count))
     return ("max-patch",) if event_list else ()
+
+
+def _wheelset_force_labels(events: Iterable[FullCaseProgressEvent]) -> tuple[str, ...]:
+    event_list = tuple(events)
+    for event in event_list:
+        labels = tuple(getattr(event, "wheelset_force_labels", ()) or ())
+        if labels:
+            return tuple(str(label) for label in labels)
+    labels: list[str] = []
+    for patch_label in _patch_force_labels(event_list):
+        wheelset = str(patch_label).split("-", 1)[0]
+        if wheelset and wheelset not in labels and wheelset != "max":
+            labels.append(wheelset)
+    return tuple(labels)
+
+
+def _force_matrix(value: Any, rows: int) -> np.ndarray:
+    array = np.asarray(value, dtype=float)
+    if array.size == 0:
+        return np.full((rows, 2), np.nan, dtype=float)
+    array = array.reshape((-1, 2))
+    result = np.full((rows, 2), np.nan, dtype=float)
+    copied = min(rows, array.shape[0])
+    result[:copied, :] = array[:copied, :]
+    return result
+
+
+def _wheelset_mileages(event: FullCaseProgressEvent, rows: int) -> np.ndarray:
+    result = np.full((rows,), np.nan, dtype=float)
+    values = np.asarray(getattr(event, "wheelset_mileage", ()), dtype=float).reshape(-1)
+    copied = min(rows, values.size)
+    if copied:
+        result[:copied] = values[:copied]
+    return result
+
+
+def _write_wheel_rail_force_csv(path: Path, events: tuple[FullCaseProgressEvent, ...]) -> None:
+    """Write one accepted-step row per physical wheel (four wheelsets x two sides)."""
+
+    wheelsets = _wheelset_force_labels(events)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            "stage,step,n_steps,time_s,dt_s,front_mileage_m,wheelset_mileage_m,"
+            "iterations,retry_count,wheelset,side,lateral_force_y_N,vertical_force_z_N,"
+            "resultant_yz_force_N\n"
+        )
+        for event in events:
+            lateral = _force_matrix(getattr(event, "wheel_lateral_force_y", ()), len(wheelsets))
+            vertical = _force_matrix(getattr(event, "wheel_vertical_force_z", ()), len(wheelsets))
+            mileages = _wheelset_mileages(event, len(wheelsets))
+            for wheel_index, wheelset in enumerate(wheelsets):
+                for side_index, side in enumerate(("L", "R")):
+                    force_y = float(lateral[wheel_index, side_index])
+                    force_z = float(vertical[wheel_index, side_index])
+                    resultant = float(np.hypot(force_y, force_z))
+                    handle.write(
+                        f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
+                        f"{event.front_mileage:.17g},{mileages[wheel_index]:.17g},{event.iterations},"
+                        f"{event.retry_count},{wheelset},{side},{force_y:.17g},{force_z:.17g},{resultant:.17g}\n"
+                    )
+
+
+def _write_contact_patch_force_csv(path: Path, events: tuple[FullCaseProgressEvent, ...]) -> None:
+    """Write one accepted-step row per configured contact slot (L1/R1 or turnout rails)."""
+
+    patch_labels = _patch_force_labels(events)
+    wheelsets = _wheelset_force_labels(events)
+    wheelset_index = {label: index for index, label in enumerate(wheelsets)}
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(
+            "stage,step,n_steps,time_s,dt_s,front_mileage_m,wheelset_mileage_m,"
+            "iterations,retry_count,wheelset,side,dummy_rail,lateral_force_y_N,"
+            "vertical_force_z_N,resultant_yz_force_N\n"
+        )
+        for event in events:
+            lateral = np.full((len(patch_labels),), np.nan, dtype=float)
+            vertical = np.full((len(patch_labels),), np.nan, dtype=float)
+            resultants = np.full((len(patch_labels),), np.nan, dtype=float)
+            source_y = np.asarray(getattr(event, "patch_lateral_force_y", ()), dtype=float).reshape(-1)
+            source_z = np.asarray(event.patch_vertical_force_z, dtype=float).reshape(-1)
+            source_resultant = np.asarray(event.patch_force_magnitude, dtype=float).reshape(-1)
+            lateral[: min(lateral.size, source_y.size)] = source_y[: lateral.size]
+            vertical[: min(vertical.size, source_z.size)] = source_z[: vertical.size]
+            resultants[: min(resultants.size, source_resultant.size)] = source_resultant[: resultants.size]
+            mileages = _wheelset_mileages(event, len(wheelsets))
+            for patch_index, label in enumerate(patch_labels):
+                wheelset, separator, dummy_rail = str(label).partition("-")
+                side = dummy_rail[:1] if separator and dummy_rail[:1] in {"L", "R"} else ""
+                mileage_index = wheelset_index.get(wheelset)
+                wheelset_mileage = (
+                    float(mileages[mileage_index]) if mileage_index is not None else float("nan")
+                )
+                resultant = float(resultants[patch_index])
+                if not np.isfinite(resultant):
+                    resultant = float(np.hypot(lateral[patch_index], vertical[patch_index]))
+                handle.write(
+                    f"{event.stage},{event.step_index},{event.n_steps},{event.time:.17g},{event.dt:.17g},"
+                    f"{event.front_mileage:.17g},{wheelset_mileage:.17g},{event.iterations},"
+                    f"{event.retry_count},{wheelset},{side},{dummy_rail},{lateral[patch_index]:.17g},"
+                    f"{vertical[patch_index]:.17g},{resultant:.17g}\n"
+                )
 
 
 def _patch_force_column(label: str) -> str:
@@ -1921,34 +2365,70 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
             if state.get("resume_checkpoint") and state.get("checkpoint_summary"):
                 summary = state["checkpoint_summary"]
                 state["resumed_text"] = f"Resumed from checkpoint at {float(summary.get('front_mileage', 0.0)):.3f} m."
-            state["paths"] = write_full_case_short_run_report(
-                args.output_dir,
-                cut_freq=cut_freq,
-                dt=args.dt,
-                n_steps_per_stage=args.steps,
-                use_sparse=not args.dense,
-                use_matlab_mileage_endpoints=args.matlab_mileage_endpoints,
-                plot_progress=args.plot_progress,
-                plot_every=args.plot_every,
-                save_progress=True,
-                preload_cache_dir=args.preload_cache_dir,
-                history_retention_steps=args.history_retention_steps,
-                checkpoint_dir=args.checkpoint_dir,
-                save_checkpoints=bool(state.get("save_checkpoints")),
-                resume_checkpoint=bool(state.get("resume_checkpoint")),
-                resume_checkpoint_path=state.get("resume_checkpoint_path"),
-                progress_recorder=progress_recorder,
-                matlab_baseline_path=args.matlab_baseline,
-                abs_tolerance=args.abs_tol,
-                rel_tolerance=args.rel_tol,
-                rail_layout=args.rail_layout,
-                track_irregularity=args.track_irregularity,
-                irregularity_seed=args.irregularity_seed,
-            )
+            if args.contact_key_data_only:
+                state["paths"] = (
+                    run_full_case_contact_key_data(
+                        args.output_dir,
+                        cut_freq=cut_freq,
+                        dt=args.dt,
+                        n_steps_per_stage=args.steps,
+                        use_sparse=not args.dense,
+                        use_matlab_mileage_endpoints=args.matlab_mileage_endpoints,
+                        history_retention_steps=args.history_retention_steps,
+                        progress_callback=progress_recorder,
+                        rail_layout=args.rail_layout,
+                        track_irregularity=args.track_irregularity,
+                        irregularity_seed=args.irregularity_seed,
+                        contact_geometry_mode=args.contact_geometry_mode,
+                        network_a_model_path=args.network_a_model,
+                        network_a_force_mode=args.network_a_force_mode,
+                        contact_force_tolerance=args.contact_force_tolerance,
+                    ),
+                )
+            else:
+                state["paths"] = write_full_case_short_run_report(
+                    args.output_dir,
+                    cut_freq=cut_freq,
+                    dt=args.dt,
+                    n_steps_per_stage=args.steps,
+                    use_sparse=not args.dense,
+                    use_matlab_mileage_endpoints=args.matlab_mileage_endpoints,
+                    plot_progress=args.plot_progress,
+                    plot_every=args.plot_every,
+                    save_progress=True,
+                    save_contact_key_data=args.save_contact_key_data,
+                    preload_cache_dir=args.preload_cache_dir,
+                    history_retention_steps=args.history_retention_steps,
+                    checkpoint_dir=args.checkpoint_dir,
+                    save_checkpoints=bool(state.get("save_checkpoints")),
+                    resume_checkpoint=bool(state.get("resume_checkpoint")),
+                    resume_checkpoint_path=state.get("resume_checkpoint_path"),
+                    progress_recorder=progress_recorder,
+                    matlab_baseline_path=args.matlab_baseline,
+                    abs_tolerance=args.abs_tol,
+                    rel_tolerance=args.rel_tol,
+                    rail_layout=args.rail_layout,
+                    track_irregularity=args.track_irregularity,
+                    irregularity_seed=args.irregularity_seed,
+                    contact_geometry_mode=args.contact_geometry_mode,
+                    network_a_model_path=args.network_a_model,
+                    network_a_trace_dir=args.network_a_trace_dir,
+                    network_a_trace_mode=args.network_a_trace_mode,
+                    network_a_trace_low_confidence=args.network_a_trace_low_confidence,
+                    network_a_trace_sample_interval_m=_positive_or_none(
+                        args.network_a_trace_sample_interval_m
+                    ),
+                    network_a_force_mode=args.network_a_force_mode,
+                    network_b_model_path=args.network_b_model,
+                    network_b_ood_threshold=args.network_b_ood_threshold,
+                    network_b_ood_fallback=args.network_b_ood_fallback,
+                    contact_force_tolerance=args.contact_force_tolerance,
+                    snapshot_history_limit=args.snapshot_history_limit,
+                )
         except Exception as exc:  # pragma: no cover - exercised manually with GUI failures.
             state["error"] = f"{type(exc).__name__}: {exc}"
             state["traceback"] = traceback.format_exc()
-            if recorder.snapshot():
+            if recorder.snapshot() and not args.contact_key_data_only:
                 try:
                     recorder.write_outputs(args.output_dir)
                 except Exception:
@@ -1973,9 +2453,8 @@ def _run_with_live_window(args: argparse.Namespace, *, cut_freq: float | None) -
         print(state["traceback"])
     paths = state.get("paths")
     if paths:
-        snapshot_path, report_path = paths
-        print(f"wrote {snapshot_path}")
-        print(f"wrote {report_path}")
+        for path in paths:
+            print(f"wrote {path}")
     return 1 if state.get("error") else 0
 
 
@@ -2023,6 +2502,24 @@ def _checkpoint_settings_for_args(args: argparse.Namespace, *, cut_freq: float |
             model=args.track_irregularity,
             seed=args.irregularity_seed,
         ),
+        contact_geometry_mode=args.contact_geometry_mode,
+        network_a_model_path=args.network_a_model,
+        network_a_trace_dir=args.network_a_trace_dir,
+        network_a_trace_mode=args.network_a_trace_mode,
+        network_a_trace_low_confidence=args.network_a_trace_low_confidence,
+        network_a_trace_sample_interval_m=_positive_or_none(
+            args.network_a_trace_sample_interval_m
+        ),
+        network_a_force_mode=args.network_a_force_mode,
+        network_b_model_path=args.network_b_model,
+        network_b_ood_threshold=args.network_b_ood_threshold,
+        network_b_ood_fallback=args.network_b_ood_fallback,
+        iteration_settings=CoupledIterationSettings(
+            max_iterations=11,
+            force_tolerance=args.contact_force_tolerance,
+            absolute_force_tolerance=1.0e-6,
+            relaxation=1.0,
+        ),
     )
 
 
@@ -2037,6 +2534,12 @@ def _read_json(path: str | Path) -> dict[str, Any]:
 def _history_retention_arg(value: str) -> int | None:
     parsed = int(value)
     return None if parsed <= 0 else parsed
+
+
+def _positive_or_none(value: float | None) -> float | None:
+    if value is None or float(value) <= 0.0:
+        return None
+    return float(value)
 
 
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -2061,6 +2564,108 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=20260716,
         help="Random-phase seed used by the track-irregularity reconstruction.",
     )
+    parser.add_argument(
+        "--contact-geometry-mode",
+        choices=(
+            "traditional",
+            "network-a",
+            "network-a-after-preload",
+            "network-a1-direct-after-preload",
+        ),
+        default="traditional",
+        help=(
+            "Use traditional geometry, strict WRCP-Net A2G replacement, or traditional "
+            "Preload followed by strict A2G replacement in Cal, or traditional "
+            "Preload followed by direct final-patch A1 + Network B in Cal."
+        ),
+    )
+    parser.add_argument(
+        "--network-a-model",
+        type=Path,
+        default=DEFAULT_NETWORK_A_MODEL,
+        help=(
+            "Network A model artifact. Direct mode normally uses "
+            "outputs/wrcp_net_a1_direct/model.npz."
+        ),
+    )
+    force_mode_group = parser.add_mutually_exclusive_group()
+    force_mode_group.add_argument(
+        "--network-a-force-mode",
+        choices=("traditional", "hertz", "network-b"),
+        default="traditional",
+        help=(
+            "Use STRIPES (traditional), analytical Hertz, or WRCP-Net B while "
+            "Network A geometry is active."
+        ),
+    )
+    force_mode_group.add_argument(
+        "--disable-network-b",
+        action="store_true",
+        help=(
+            "Explicitly keep Network B unloaded and use the traditional STRIPES + Kalker "
+            "force law as the primary force calculation; no Network B fallback is active."
+        ),
+    )
+    parser.add_argument(
+        "--network-b-model",
+        type=Path,
+        default=DEFAULT_NETWORK_B_MODEL,
+        help="WRCP-Net B artifact used by --network-a-force-mode network-b.",
+    )
+    parser.add_argument(
+        "--network-b-ood-threshold",
+        type=float,
+        default=4.0,
+        help="Maximum standardized feature distance before traditional-force fallback.",
+    )
+    parser.add_argument(
+        "--network-b-ood-fallback",
+        choices=("traditional", "hertz"),
+        default="traditional",
+        help="Force law used when Network B input is outside its training distribution.",
+    )
+    parser.add_argument(
+        "--contact-force-tolerance",
+        type=float,
+        default=2.5e-3,
+        help="Relative nonlinear contact-force convergence tolerance.",
+    )
+    parser.add_argument(
+        "--network-a-trace-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Enable Network A runtime tracing in this directory. Omit this option in "
+            "production to disable all trace collection."
+        ),
+    )
+    parser.add_argument(
+        "--network-a-trace-mode",
+        choices=("selective", "full"),
+        default="selective",
+        help=(
+            "With a trace directory, retain accepted-final and exceptional steps "
+            "(selective, default), or every nonlinear candidate iteration (full debug)."
+        ),
+    )
+    parser.add_argument(
+        "--network-a-trace-low-confidence",
+        type=float,
+        default=0.95,
+        help=(
+            "In selective mode, retain all iterations when maximum class probability "
+            "is below this value."
+        ),
+    )
+    parser.add_argument(
+        "--network-a-trace-sample-interval-m",
+        type=float,
+        default=1.0,
+        help=(
+            "In selective mode, retain all iterations when crossing each absolute-mileage "
+            "interval; use 0 to disable mileage sampling."
+        ),
+    )
     parser.add_argument("--dt", type=float, default=1.0e-4)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument(
@@ -2073,6 +2678,22 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dense", action="store_true", help="Use dense system matrices.")
     parser.add_argument("--plot-progress", action="store_true", help="Compatibility alias for final progress output.")
     parser.add_argument("--save-progress", action="store_true", help="Write final progress CSV and SVG after the run completes.")
+    parser.add_argument(
+        "--save-contact-key-data",
+        action="store_true",
+        help=(
+            "Stream only accepted-step wheel/rail force and contact-location key data "
+            "to wheel_rail_contact_key_data.csv."
+        ),
+    )
+    parser.add_argument(
+        "--contact-key-data-only",
+        action="store_true",
+        help=(
+            "Write only wheel_rail_contact_key_data.csv from accepted steps; do not "
+            "write progress, validation snapshot, report, timing, or Network A trace files."
+        ),
+    )
     parser.add_argument("--live-window", action="store_true", help="Show a Tk realtime progress window while the simulation runs.")
     parser.add_argument(
         "--preload-cache-dir",
@@ -2117,6 +2738,15 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=256,
         help="Retain only this many recent full-state diagnostic steps in memory; use 0 to keep all.",
     )
+    parser.add_argument(
+        "--snapshot-history-limit",
+        type=int,
+        default=None,
+        help=(
+            "Serialize only the latest N retained steps per stage while preserving "
+            "the accepted-step count; recommended for full-mileage runs."
+        ),
+    )
     parser.add_argument("--plot-every", type=int, default=1, help="Reserved progress refresh interval; final files are written once.")
     parser.add_argument("--abs-tol", type=float, default=DEFAULT_ABS_TOLERANCE)
     parser.add_argument("--rel-tol", type=float, default=DEFAULT_REL_TOLERANCE)
@@ -2125,9 +2755,35 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.snapshot_history_limit is not None and args.snapshot_history_limit <= 0:
+        raise SystemExit("--snapshot-history-limit must be positive")
+    if (
+        args.contact_geometry_mode == "network-a1-direct-after-preload"
+        and args.network_a_model == DEFAULT_NETWORK_A_MODEL
+    ):
+        args.network_a_model = DEFAULT_NETWORK_A1_DIRECT_MODEL
     cut_freq = None if args.full_size else args.cut_freq
     if args.live_window:
         return _run_with_live_window(args, cut_freq=cut_freq)
+    if args.contact_key_data_only:
+        csv_path = run_full_case_contact_key_data(
+            args.output_dir,
+            cut_freq=cut_freq,
+            dt=args.dt,
+            n_steps_per_stage=args.steps,
+            use_sparse=not args.dense,
+            use_matlab_mileage_endpoints=args.matlab_mileage_endpoints,
+            history_retention_steps=args.history_retention_steps,
+            rail_layout=args.rail_layout,
+            track_irregularity=args.track_irregularity,
+            irregularity_seed=args.irregularity_seed,
+            contact_geometry_mode=args.contact_geometry_mode,
+            network_a_model_path=args.network_a_model,
+            network_a_force_mode=args.network_a_force_mode,
+            contact_force_tolerance=args.contact_force_tolerance,
+        )
+        print(f"wrote {csv_path}")
+        return 0
     snapshot_path, report_path = write_full_case_short_run_report(
         args.output_dir,
         cut_freq=cut_freq,
@@ -2138,6 +2794,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         plot_progress=args.plot_progress,
         plot_every=args.plot_every,
         save_progress=args.save_progress,
+        save_contact_key_data=args.save_contact_key_data,
         preload_cache_dir=args.preload_cache_dir,
         history_retention_steps=args.history_retention_steps,
         checkpoint_dir=args.checkpoint_dir,
@@ -2150,6 +2807,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         rail_layout=args.rail_layout,
         track_irregularity=args.track_irregularity,
         irregularity_seed=args.irregularity_seed,
+        contact_geometry_mode=args.contact_geometry_mode,
+        network_a_model_path=args.network_a_model,
+        network_a_trace_dir=args.network_a_trace_dir,
+        network_a_trace_mode=args.network_a_trace_mode,
+        network_a_trace_low_confidence=args.network_a_trace_low_confidence,
+        network_a_trace_sample_interval_m=_positive_or_none(
+            args.network_a_trace_sample_interval_m
+        ),
+        network_a_force_mode=args.network_a_force_mode,
+        network_b_model_path=args.network_b_model,
+        network_b_ood_threshold=args.network_b_ood_threshold,
+        network_b_ood_fallback=args.network_b_ood_fallback,
+        contact_force_tolerance=args.contact_force_tolerance,
+        snapshot_history_limit=args.snapshot_history_limit,
     )
     print(f"wrote {snapshot_path}")
     print(f"wrote {report_path}")

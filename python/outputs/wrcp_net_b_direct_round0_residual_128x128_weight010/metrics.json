@@ -1,0 +1,146 @@
+{
+  "model": "WRCP-Net B",
+  "schema": "wrcp-net-b-direct-force-residual-v3",
+  "best_epoch": 121,
+  "best_validation_huber_loss": 0.0006925978325347479,
+  "hidden_sizes": [
+    128,
+    128
+  ],
+  "training_configuration": {
+    "epochs": 150,
+    "batch_size": 256,
+    "learning_rate": 0.0008,
+    "weight_decay": 1e-05,
+    "huber_delta": 0.5,
+    "patience": 30,
+    "seed": 20260720,
+    "friction_limit": 0.4,
+    "feature_clip": 6.0,
+    "normal_force_mode": "hertz_residual",
+    "ood_training_quantile": 0.9999,
+    "ood_calibration_threshold": 4.0,
+    "loss_weights": [
+      0.10000000149011612,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "split": {
+    "train_seeds": [
+      20260716,
+      20260717,
+      20260718,
+      20260719,
+      20260720,
+      20260723,
+      20260724,
+      20260725
+    ],
+    "validation_seeds": [
+      20260721
+    ],
+    "train_rows": 542464,
+    "validation_rows": 67808
+  },
+  "train": {
+    "per_target": {
+      "normal_force_N": {
+        "mae": 7.9986206683384085,
+        "rmse": 86.70053572599679,
+        "nrmse_percent": 0.1206053789984817
+      },
+      "creep_force_track_x_N": {
+        "mae": 4.946649837759739,
+        "rmse": 6.814931828291852,
+        "nrmse_percent": 0.11326671132451724
+      },
+      "creep_force_track_y_N": {
+        "mae": 11.002989334232755,
+        "rmse": 15.74526418470646,
+        "nrmse_percent": 0.09286759648749472
+      },
+      "creep_force_track_z_N": {
+        "mae": 0.28923771126659803,
+        "rmse": 0.41079155026803266,
+        "nrmse_percent": 0.10795850033159077
+      },
+      "creep_moment_track_x_Nm": {
+        "mae": 1.7539662384625458e-07,
+        "rmse": 3.335914804933104e-07,
+        "nrmse_percent": 0.09028695866711951
+      },
+      "creep_moment_track_y_Nm": {
+        "mae": 0.0008455933942665723,
+        "rmse": 0.0017848213482771862,
+        "nrmse_percent": 0.1531088995097339
+      },
+      "creep_moment_track_z_Nm": {
+        "mae": 0.03167316455677449,
+        "rmse": 0.06829024225483421,
+        "nrmse_percent": 0.1113306863979199
+      }
+    },
+    "combined_force_vector_rmse_N": 88.3847935459278,
+    "combined_force_vector_nrmse_percent": 0.12300081349730112
+  },
+  "validation": {
+    "per_target": {
+      "normal_force_N": {
+        "mae": 10.69305281642487,
+        "rmse": 103.37790475687193,
+        "nrmse_percent": 0.14608848394902116
+      },
+      "creep_force_track_x_N": {
+        "mae": 4.833359033460405,
+        "rmse": 6.880251529620413,
+        "nrmse_percent": 0.1424287376455893
+      },
+      "creep_force_track_y_N": {
+        "mae": 12.489615905143387,
+        "rmse": 19.281867785583536,
+        "nrmse_percent": 0.1466934258205182
+      },
+      "creep_force_track_z_N": {
+        "mae": 0.32348805033098754,
+        "rmse": 0.4770629193247693,
+        "nrmse_percent": 0.14889597987072556
+      },
+      "creep_moment_track_x_Nm": {
+        "mae": 2.0071160821579113e-07,
+        "rmse": 4.296570620328956e-07,
+        "nrmse_percent": 0.22354441883037976
+      },
+      "creep_moment_track_y_Nm": {
+        "mae": 0.0009923247535944151,
+        "rmse": 0.0022633305354041533,
+        "nrmse_percent": 0.29466109852346634
+      },
+      "creep_moment_track_z_Nm": {
+        "mae": 0.039022022630277646,
+        "rmse": 0.08553436995067913,
+        "nrmse_percent": 0.20237463376036524
+      }
+    },
+    "combined_force_vector_rmse_N": 105.3439318085936,
+    "combined_force_vector_nrmse_percent": 0.14890970526876862
+  },
+  "model_sha256": "b0774086e7f65c3e8d2390ce689aae9ddd098e8f018ebde73e2766db6ad563c6",
+  "ood": {
+    "calibration_threshold": 4.0,
+    "training_quantile": 0.9999,
+    "train_out_of_distribution_fraction": 0.0009290939122227465,
+    "validation_out_of_distribution_fraction": 0.004630722038697499
+  },
+  "training_metadata": {
+    "train_dataset_dir": "outputs/network_b_direct_dataset_v3_round0",
+    "validation_dataset_dir": "outputs/network_b_direct_dataset_v3_validation",
+    "aux_dataset_dir": null,
+    "unfiltered_train_rows": 542464,
+    "max_train_teacher_match_um": null
+  }
+}

@@ -110,6 +110,7 @@ def run_coupled_time_iteration(
     time0: float = 0.0,
     step_index0: int = 0,
     step_dt_callback: StepDtCallback | None = None,
+    time_end: float | None = None,
 ) -> CoupledTimeIterationResult:
     """Run the coupled main loop with force convergence and step-size retry.
 
@@ -127,6 +128,8 @@ def run_coupled_time_iteration(
         raise ValueError("history_retention_steps must be positive")
     if step_index0 < 0:
         raise ValueError("step_index0 cannot be negative")
+    if time_end is not None and (not np.isfinite(time_end) or time_end < time0):
+        raise ValueError("time_end must be finite and no earlier than time0")
     settings = settings or CoupledIterationSettings()
     if settings.min_dt > dt:
         raise ValueError("min_dt cannot exceed dt")
@@ -185,7 +188,16 @@ def run_coupled_time_iteration(
     accepted_steps = 0
     retry_count = 0
     accepted_step_wall_start = time.perf_counter()
-    while accepted_steps < n_steps:
+    maximum_accepted_steps = max(int(n_steps) * 16 + 1024, int(n_steps))
+    time_tolerance = 1.0e-12 if time_end is None else max(
+        1.0e-12,
+        abs(float(time_end)) * np.finfo(float).eps * 8.0,
+    )
+    while accepted_steps < n_steps or (
+        time_end is not None and time_history[-1] < float(time_end) - time_tolerance
+    ):
+        if accepted_steps >= maximum_accepted_steps:
+            raise RuntimeError("coupled iteration did not reach time_end within its safety limit")
         if retry_count == 0:
             current_dt = _scheduled_dt(
                 step_dt_callback,
@@ -372,6 +384,11 @@ def _attempt_coupled_step(
         start = time.perf_counter()
         contact_geometry = callbacks.contact_geometry(state, rail_response)
         _add_timing(timing, "contact_geometry", start)
+        _add_nested_timing(
+            timing,
+            getattr(contact_geometry, "timing", None),
+            prefix="contact_geometry.",
+        )
         start = time.perf_counter()
         contact_force = _as_vector(callbacks.contact_force(state, rail_response, contact_geometry), system.ndof)
         _add_timing(timing, "contact_force", start)
@@ -408,6 +425,19 @@ def _add_timing(timing: dict[str, float] | None, name: str, start: float) -> Non
     if timing is None:
         return
     timing[name] = timing.get(name, 0.0) + (time.perf_counter() - start)
+
+
+def _add_nested_timing(
+    timing: dict[str, float] | None,
+    nested: Mapping[str, float] | None,
+    *,
+    prefix: str,
+) -> None:
+    if timing is None or not nested:
+        return
+    for name, seconds in nested.items():
+        key = f"{prefix}{name}"
+        timing[key] = timing.get(key, 0.0) + float(seconds)
 
 
 def _scheduled_dt(callback: StepDtCallback | None, step_index: int, time_current: float, nominal_dt: float) -> float:

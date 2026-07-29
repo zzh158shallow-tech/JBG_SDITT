@@ -107,7 +107,12 @@ class FullCaseProgressEvent:
     max_patch_force_z: float
     patch_force_labels: tuple[str, ...] = ()
     patch_force_magnitude: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
+    patch_lateral_force_y: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
     patch_vertical_force_z: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
+    wheelset_force_labels: tuple[str, ...] = ()
+    wheelset_mileage: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=float))
+    wheel_lateral_force_y: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=float))
+    wheel_vertical_force_z: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=float))
     profile_snapshot: FullCaseProfileSnapshot | None = None
     timing: Mapping[str, float] = field(default_factory=dict)
     step_wall_time: float = 0.0
@@ -134,6 +139,7 @@ class FullDefaultCaseSettings:
     use_sparse: bool = True
     fail_on_missing_physics: bool = False
     progress_callback: Callable[[FullCaseProgressEvent], None] | None = None
+    accepted_contact_callback: Callable[["FullCaseAcceptedContactSnapshot"], None] | None = None
     frozen_contact_input: "FullCaseFrozenContactInput | None" = None
     preload_cache_dir: str | Path | None = None
     history_retention_steps: int | None = 256
@@ -143,6 +149,17 @@ class FullDefaultCaseSettings:
     resume_checkpoint_path: str | Path | None = None
     checkpoint_interval_m: float | None = 10.0
     track_irregularity: TrackIrregularitySettings = TrackIrregularitySettings()
+    contact_geometry_mode: str = "traditional"
+    network_a_model_path: str | Path = Path("outputs/wrcp_net_a2g/model.npz")
+    network_a_trace_dir: str | Path | None = None
+    network_a_trace_mode: str = "selective"
+    network_a_trace_low_confidence: float = 0.95
+    network_a_trace_sample_interval_m: float | None = 1.0
+    network_a_force_mode: str = "traditional"
+    network_b_model_path: str | Path = Path("outputs/wrcp_net_b/model.npz")
+    network_b_shadow_teacher: bool = False
+    network_b_ood_threshold: float = 4.0
+    network_b_ood_fallback: str = "traditional"
     iteration_settings: CoupledIterationSettings = CoupledIterationSettings(
         max_iterations=11,
         force_tolerance=2.5e-3,
@@ -179,6 +196,9 @@ class FullDefaultCasePreparation:
     shape_function_context: ModalBeamShapeFunctionContext
     track_contact_parameters: DefaultTrackContactParameters
     track_irregularity_profile: TrackIrregularityProfile | None
+    network_a_contact_adapter: Any | None
+    network_b_force_model: Any | None
+    network_b_model_path: Path | None
     stage_inp_par: dict[SimulationStage, dict[str, object]]
     missing_stages: tuple[MissingFullCaseStage, ...]
 
@@ -222,6 +242,24 @@ class FullCaseContactDiagnostics:
     contact_force_enabled: bool
     missing_stages: tuple[str, ...]
     wheel_rail_contact: FullCaseWheelRailContactResult | None = None
+    timing: Mapping[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FullCaseAcceptedContactSnapshot:
+    """Compact contact payload emitted only after a time step is accepted."""
+
+    stage: SimulationStage
+    step_index: int
+    iterations: int
+    time: float
+    dt: float
+    retry_count: int
+    front_mileage: float
+    wheel_pose_by_wheelset: dict[str, WheelPose2D]
+    effective_rail_displacement_by_wheelset_side: dict[str, dict[str, np.ndarray]]
+    wheel_rail_contact: FullCaseWheelRailContactResult
+    dummy_rail_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -394,7 +432,7 @@ class MissingFullCasePhysicsError(RuntimeError):
 
 
 _PRELOAD_CACHE_VERSION = 2
-_RUN_CHECKPOINT_VERSION = 2
+_RUN_CHECKPOINT_VERSION = 4
 
 
 def _preload_cache_path(preparation: FullDefaultCasePreparation) -> Path | None:
@@ -456,6 +494,21 @@ def _preload_cache_fingerprint(preparation: FullDefaultCasePreparation) -> dict[
             "use_matlab_mileage_endpoints": settings.use_matlab_mileage_endpoints,
             "use_sparse": settings.use_sparse,
             "track_irregularity": asdict(settings.track_irregularity),
+            "contact_geometry_mode": settings.contact_geometry_mode,
+            "network_a_model": (
+                None
+                if preparation.network_a_contact_adapter is None
+                else _file_fingerprint(preparation.network_a_contact_adapter.model_path)
+            ),
+            "network_a_force_mode": settings.network_a_force_mode,
+            "network_b_model": (
+                None
+                if preparation.network_b_model_path is None
+                else _file_fingerprint(preparation.network_b_model_path)
+            ),
+            "network_b_shadow_teacher": settings.network_b_shadow_teacher,
+            "network_b_ood_threshold": settings.network_b_ood_threshold,
+            "network_b_ood_fallback": settings.network_b_ood_fallback,
             "iteration_settings": asdict(settings.iteration_settings),
         },
         "input_files": {
@@ -652,6 +705,11 @@ def _write_run_checkpoint(
             "velocity_history_seed": _copy_cached_array(accepted.velocity_history_seed),
             "acceleration_history_seed": _copy_cached_array(accepted.acceleration_history_seed),
             "progress_events": tuple(progress_events),
+            "network_a_continuity_state": (
+                None
+                if preparation.network_a_contact_adapter is None
+                else preparation.network_a_contact_adapter.export_continuity_state()
+            ),
         },
     }
     with checkpoint_path.open("wb") as handle:
@@ -672,6 +730,7 @@ def _write_preload_cache(
     velocity_history_seed: np.ndarray | None,
     acceleration_history_seed: np.ndarray | None,
     preload_events: tuple[FullCaseProgressEvent, ...] = (),
+    network_a_continuity_state: Mapping[str, Any] | None = None,
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -687,6 +746,7 @@ def _write_preload_cache(
             "velocity_history_seed": _copy_cached_array(velocity_history_seed),
             "acceleration_history_seed": _copy_cached_array(acceleration_history_seed),
             "preload_events": tuple(preload_events),
+            "network_a_continuity_state": network_a_continuity_state,
         },
     }
     with cache_path.open("wb") as handle:
@@ -715,6 +775,58 @@ def prepare_default_full_case(
 
     settings = settings or FullDefaultCaseSettings()
     paths = ProjectPaths.from_repo_root(repo_root)
+    if settings.contact_geometry_mode not in (
+        "traditional",
+        "network-a",
+        "network-a-after-preload",
+        "network-a1-direct-after-preload",
+    ):
+        raise ValueError(
+            "contact_geometry_mode must be 'traditional', 'network-a', "
+            "'network-a-after-preload', or 'network-a1-direct-after-preload', got "
+            f"{settings.contact_geometry_mode!r}"
+        )
+    if settings.contact_geometry_mode != "traditional" and operating_case.rail_layout != "interval":
+        raise ValueError("WRCP-Net A2G full replacement supports interval L1+R1 layout only")
+    if settings.network_a_trace_mode not in {"selective", "full"}:
+        raise ValueError("network_a_trace_mode must be 'selective' or 'full'")
+    if not 0.0 <= float(settings.network_a_trace_low_confidence) <= 1.0:
+        raise ValueError("network_a_trace_low_confidence must be in [0, 1]")
+    if (
+        settings.network_a_trace_sample_interval_m is not None
+        and float(settings.network_a_trace_sample_interval_m) <= 0.0
+    ):
+        raise ValueError("network_a_trace_sample_interval_m must be positive or None")
+    if settings.network_a_force_mode not in {"traditional", "hertz", "network-b"}:
+        raise ValueError("network_a_force_mode must be 'traditional', 'hertz', or 'network-b'")
+    if settings.network_a_force_mode == "network-b" and settings.contact_geometry_mode == "traditional":
+        raise ValueError("network-B force replacement requires Network A contact geometry")
+    direct_a1 = settings.contact_geometry_mode == "network-a1-direct-after-preload"
+    if direct_a1 and settings.network_a_force_mode == "traditional":
+        raise ValueError(
+            "network-a1-direct-after-preload requires network_a_force_mode='network-b' "
+            "or 'hertz' for explicit validation"
+        )
+    if direct_a1 and settings.network_b_ood_fallback != "hertz":
+        raise ValueError("network-A1 Direct requires network_b_ood_fallback='hertz'")
+    if float(settings.network_b_ood_threshold) <= 0.0:
+        raise ValueError("network_b_ood_threshold must be positive")
+    if settings.network_b_ood_fallback not in {"traditional", "hertz"}:
+        raise ValueError("network_b_ood_fallback must be 'traditional' or 'hertz'")
+    direct_shadow_bootstrap = (
+        direct_a1
+        and settings.network_a_force_mode == "hertz"
+        and settings.network_b_shadow_teacher
+    )
+    if (
+        settings.network_b_shadow_teacher
+        and settings.network_a_force_mode != "network-b"
+        and not direct_shadow_bootstrap
+    ):
+        raise ValueError(
+            "network_b_shadow_teacher requires network_a_force_mode='network-b', "
+            "except network-A1 Direct Hertz bootstrap collection"
+        )
     if settings.use_sparse:
         system, track, vehicle = build_default_sparse_modal_rw_system_matrices(
             repo_root=paths.root,
@@ -766,6 +878,55 @@ def prepare_default_full_case(
     shared_inp_par = operating_case.to_inp_par()
     shared_inp_par.update(shape_function_context.inp_par_fields())
     track_irregularity_profile = build_track_irregularity_profile(settings.track_irregularity)
+    network_a_contact_adapter = None
+    network_b_force_model = None
+    network_b_model_path = None
+    if settings.contact_geometry_mode != "traditional":
+        if direct_a1:
+            from sditt.models.network_a1_direct_full_case import (
+                NetworkA1DirectContactGeometryAdapter as ContactGeometryAdapter,
+            )
+        else:
+            from sditt.models.network_a_full_case import (
+                NetworkAContactGeometryAdapter as ContactGeometryAdapter,
+            )
+
+        model_path = Path(settings.network_a_model_path)
+        if not model_path.is_absolute():
+            model_path = paths.root / "python" / model_path
+        if not model_path.is_file():
+            model_name = "WRCP-Net A1 Direct" if direct_a1 else "WRCP-Net A2G"
+            raise FileNotFoundError(f"{model_name} model not found: {model_path}")
+        network_a_contact_adapter = ContactGeometryAdapter.load(
+            model_path,
+            repo_root=paths.root,
+            trace_output_dir=(
+                None
+                if settings.network_a_trace_dir is None
+                else (
+                    Path(settings.network_a_trace_dir)
+                    if Path(settings.network_a_trace_dir).is_absolute()
+                    else paths.root / "python" / Path(settings.network_a_trace_dir)
+                )
+            ),
+            trace_metadata={
+                "contact_geometry_mode": settings.contact_geometry_mode,
+                "rail_layout": operating_case.rail_layout,
+                "track_irregularity": asdict(settings.track_irregularity),
+            },
+            trace_mode=settings.network_a_trace_mode,
+            trace_low_confidence_threshold=settings.network_a_trace_low_confidence,
+            trace_sample_interval_m=settings.network_a_trace_sample_interval_m,
+        )
+    if settings.network_a_force_mode == "network-b":
+        from sditt.models.wrcp_net_b import load_wrcp_net_b
+
+        network_b_model_path = Path(settings.network_b_model_path)
+        if not network_b_model_path.is_absolute():
+            network_b_model_path = paths.root / "python" / network_b_model_path
+        if not network_b_model_path.is_file():
+            raise FileNotFoundError(f"WRCP-Net B model not found: {network_b_model_path}")
+        network_b_force_model = load_wrcp_net_b(network_b_model_path)
 
     return FullDefaultCasePreparation(
         paths=paths,
@@ -781,6 +942,9 @@ def prepare_default_full_case(
         shape_function_context=shape_function_context,
         track_contact_parameters=_default_contact_track_parameters(),
         track_irregularity_profile=track_irregularity_profile,
+        network_a_contact_adapter=network_a_contact_adapter,
+        network_b_force_model=network_b_force_model,
+        network_b_model_path=network_b_model_path,
         stage_inp_par={
             stage: {
                 **shared_inp_par,
@@ -864,6 +1028,10 @@ def run_default_full_case_driver(
             contact_force = checkpoint["contact_force"].copy()
             stage_start_front_mileage = float(checkpoint["original_stage_start_front_mileage"])
             contact_state = _clone_contact_state(checkpoint["contact_state"])
+            if preparation.network_a_contact_adapter is not None:
+                preparation.network_a_contact_adapter.import_continuity_state(
+                    checkpoint.get("network_a_continuity_state")
+                )
             displacement_history_seed = _copy_cached_array(checkpoint["displacement_history_seed"])
             velocity_history_seed = _copy_cached_array(checkpoint["velocity_history_seed"])
             acceleration_history_seed = _copy_cached_array(checkpoint["acceleration_history_seed"])
@@ -892,6 +1060,10 @@ def run_default_full_case_driver(
             displacement_history_seed = _copy_cached_array(cached["displacement_history_seed"])
             velocity_history_seed = _copy_cached_array(cached["velocity_history_seed"])
             acceleration_history_seed = _copy_cached_array(cached["acceleration_history_seed"])
+            if preparation.network_a_contact_adapter is not None:
+                preparation.network_a_contact_adapter.import_continuity_state(
+                    cached.get("network_a_continuity_state")
+                )
             if preparation.settings.progress_callback is not None:
                 for event in tuple(cached.get("preload_events", ())):
                     preparation.settings.progress_callback(event)
@@ -973,8 +1145,39 @@ def run_default_full_case_driver(
 
         def accepted_callback(accepted: Any) -> None:
             nonlocal checkpoint_path, checkpoint_status
+            direct_preload = (
+                preparation.settings.contact_geometry_mode == "network-a1-direct-after-preload"
+                and stage == "Preload"
+            )
+            need_snapshot = direct_preload or preparation.settings.accepted_contact_callback is not None
+            snapshot = (
+                _accepted_contact_snapshot(preparation, stage, accepted)
+                if need_snapshot
+                else None
+            )
+            if direct_preload and preparation.network_a_contact_adapter is not None:
+                preparation.network_a_contact_adapter.seed_from_traditional_snapshot(snapshot)
+            if (
+                preparation.network_a_contact_adapter is not None
+                and _network_a_enabled_for_stage(
+                    preparation.settings.contact_geometry_mode,
+                    stage,
+                )
+            ):
+                preparation.network_a_contact_adapter.mark_accepted(
+                    stage=stage,
+                    step_index=int(accepted.step_index),
+                    iteration=int(accepted.iterations),
+                    time_s=float(accepted.time),
+                    dt_s=float(accepted.dt),
+                    retry_count=int(accepted.retry_count),
+                    front_mileage_m=float(accepted.rail_response.front_mileage),
+                )
             if progress_callback is not None:
                 progress_callback(accepted)
+            if preparation.settings.accepted_contact_callback is not None:
+                if snapshot is not None:
+                    preparation.settings.accepted_contact_callback(snapshot)
             saved_checkpoint_path = None if checkpoint_callback is None else checkpoint_callback(accepted)
             if saved_checkpoint_path is not None:
                 checkpoint_path = saved_checkpoint_path
@@ -998,6 +1201,15 @@ def run_default_full_case_driver(
             time0=stage_time0,
             step_index0=stage_step_index0,
             step_dt_callback=step_dt_callback,
+            time_end=(
+                None
+                if _stage_end_mileage(preparation, stage) is None
+                else (
+                    float(_stage_end_mileage(preparation, stage))
+                    - float(original_stage_start_front_mileage)
+                )
+                / float(preparation.operating_case.vlc)
+            ),
         )
         iteration_records, output_rows = build_stage_storage(history)
         contact_state = extract_contact_state(history)
@@ -1039,8 +1251,16 @@ def run_default_full_case_driver(
                 velocity_history_seed=velocity_history_seed,
                 acceleration_history_seed=acceleration_history_seed,
                 preload_events=tuple(preload_progress_events),
+                network_a_continuity_state=(
+                    None
+                    if preparation.network_a_contact_adapter is None
+                    else preparation.network_a_contact_adapter.export_continuity_state()
+                ),
             )
             preload_cache_status = "saved"
+
+    if preparation.network_a_contact_adapter is not None:
+        preparation.network_a_contact_adapter.close_trace()
 
     return FullDefaultCaseRunResult(
         preparation=preparation,
@@ -1257,11 +1477,30 @@ def _progress_callback(
         )
         patch_force_magnitude = np.hypot(patch_force_y, patch_force_z)
         patch_force_labels = _progress_patch_force_labels(preparation.stage_inp_par[stage])
+        wheelset_force_labels = tuple(str(value) for value in preparation.operating_case.wheelsets)
+        if contact is None:
+            wheelset_mileage = np.full((len(wheelset_force_labels),), float(rail.front_mileage), dtype=float)
+            wheel_lateral_force_y = np.zeros((len(wheelset_force_labels), 2), dtype=float)
+            wheel_vertical_force_z = np.zeros((len(wheelset_force_labels), 2), dtype=float)
+        else:
+            wheelset_mileage = np.asarray(
+                [
+                    float(contact.con_ws.get(wheelset, {}).get("Mileage", rail.front_mileage))
+                    for wheelset in wheelset_force_labels
+                ],
+                dtype=float,
+            )
+            _, _, wheel_lateral_force_y, wheel_vertical_force_z = _wheelset_force_summary(
+                preparation.operating_case,
+                contact.pjch,
+                contact.pjcc,
+                contact.prhxf,
+            )
         profile_snapshot = _progress_profile_snapshot(preparation, stage, accepted, contact)
         event = FullCaseProgressEvent(
             stage=stage,
             step_index=int(getattr(accepted, "step_index", 0) or 0),
-            n_steps=stage_steps,
+            n_steps=max(stage_steps, int(getattr(accepted, "step_index", 0) or 0)),
             time=float(accepted.time),
             dt=float(getattr(accepted, "dt", preparation.settings.dt)),
             front_mileage=float(rail.front_mileage),
@@ -1273,7 +1512,12 @@ def _progress_callback(
             max_patch_force_z=float(np.max(np.abs(patch_force_z), initial=0.0)),
             patch_force_labels=patch_force_labels,
             patch_force_magnitude=np.asarray(patch_force_magnitude, dtype=float).copy(),
+            patch_lateral_force_y=np.asarray(patch_force_y, dtype=float).copy(),
             patch_vertical_force_z=np.asarray(patch_force_z, dtype=float).copy(),
+            wheelset_force_labels=wheelset_force_labels,
+            wheelset_mileage=wheelset_mileage.copy(),
+            wheel_lateral_force_y=wheel_lateral_force_y.copy(),
+            wheel_vertical_force_z=wheel_vertical_force_z.copy(),
             profile_snapshot=profile_snapshot,
             timing=dict(getattr(accepted, "timing", {}) or {}),
             step_wall_time=float(getattr(accepted, "step_wall_time", 0.0) or 0.0),
@@ -1288,6 +1532,63 @@ def _progress_callback(
             extra_callback(event)
 
     return emit
+
+
+def _accepted_contact_snapshot(
+    preparation: FullDefaultCasePreparation,
+    stage: SimulationStage,
+    accepted: Any,
+) -> FullCaseAcceptedContactSnapshot | None:
+    diagnostics = accepted.contact_geometry
+    contact = diagnostics.wheel_rail_contact if diagnostics is not None else None
+    if contact is None:
+        return None
+
+    inp_par = preparation.stage_inp_par[stage]
+    wheelsets = tuple(str(value) for value in inp_par["Exp_WS"])
+    dummy_rails = tuple(str(value) for value in inp_par["Exp_DummyRail"])
+    dummy_rail_sides = tuple(str(value) for value in inp_par["Exp_DummyRail_WheelSide"])
+    n_contact_patch = int(inp_par["N_ConPatch"])
+    if preparation.operating_case.rail_layout != "interval":
+        raise ValueError("network-A accepted contact snapshots currently support interval rail layout only")
+
+    poses: dict[str, WheelPose2D] = {}
+    effective_displacements: dict[str, dict[str, np.ndarray]] = {}
+    structural = np.asarray(accepted.rail_response.dis_rail, dtype=float)
+    for wheel_index, wheelset in enumerate(wheelsets):
+        poses[wheelset] = _progress_wheel_pose(
+            np.asarray(accepted.displacement, dtype=float),
+            inp_par,
+            wheel_index,
+        )
+        actual_mileage = float(contact.con_ws[wheelset]["Mileage"])
+        irregularity_sample = (
+            preparation.track_irregularity_profile.sample(actual_mileage)
+            if preparation.track_irregularity_profile is not None
+            else None
+        )
+        by_side: dict[str, np.ndarray] = {}
+        for patch_index, (_dummy_rail, side) in enumerate(zip(dummy_rails, dummy_rail_sides, strict=True)):
+            row = n_contact_patch * wheel_index + patch_index
+            rail_yz = structural[row, 1:3].astype(float, copy=True)
+            if irregularity_sample is not None:
+                rail_yz += np.asarray(irregularity_sample.rail_displacement_m[side], dtype=float)
+            by_side[side] = rail_yz
+        effective_displacements[wheelset] = by_side
+
+    return FullCaseAcceptedContactSnapshot(
+        stage=stage,
+        step_index=int(getattr(accepted, "step_index", 0) or 0),
+        iterations=int(getattr(accepted, "iterations", 0) or 0),
+        time=float(accepted.time),
+        dt=float(getattr(accepted, "dt", preparation.settings.dt)),
+        retry_count=int(getattr(accepted, "retry_count", 0) or 0),
+        front_mileage=float(accepted.rail_response.front_mileage),
+        dummy_rail_labels=dummy_rails,
+        wheel_pose_by_wheelset=poses,
+        effective_rail_displacement_by_wheelset_side=effective_displacements,
+        wheel_rail_contact=contact,
+    )
 
 
 def _progress_patch_force_labels(inp_par: Mapping[str, object]) -> tuple[str, ...]:
@@ -1532,8 +1833,15 @@ def _diagnostic_callbacks(
                 if step_input_state is not None
                 else None
             )
+            use_network_a = _network_a_enabled_for_stage(
+                preparation.settings.contact_geometry_mode,
+                stage,
+            )
+            contact_inp_par = preparation.stage_inp_par[stage]
+            if use_network_a and preparation.settings.network_a_force_mode == "hertz":
+                contact_inp_par = {**contact_inp_par, "Type_Normal": "Hertz"}
             wheel_rail_contact = solve_default_wheel_rail_contact(
-                preparation.stage_inp_par[stage],
+                contact_inp_par,
                 preparation.vehicle_parameters.values,
                 preparation.wheel_profiles,
                 selected_profiles,
@@ -1546,6 +1854,27 @@ def _diagnostic_callbacks(
                 previous_relvel_max_by_wheelset=previous_relvel_max_by_wheelset,
                 use_cal_d0_trace=preparation.total_dof > 1000,
                 track_irregularity=preparation.track_irregularity_profile,
+                network_a_adapter=(
+                    preparation.network_a_contact_adapter if use_network_a else None
+                ),
+                network_b_model=(
+                    preparation.network_b_force_model
+                    if use_network_a and preparation.settings.network_a_force_mode == "network-b"
+                    else None
+                ),
+                network_b_shadow_teacher=(
+                    use_network_a
+                    and preparation.settings.network_b_shadow_teacher
+                ),
+                network_b_ood_threshold=preparation.settings.network_b_ood_threshold,
+                network_b_ood_fallback=preparation.settings.network_b_ood_fallback,
+                network_a_diagnostic_context={
+                    "stage": stage,
+                    "step_index": int(state.step_index),
+                    "iteration": int(state.iteration),
+                    "time_s": float(state.time),
+                    "dt_s": float(state.dt),
+                },
             )
             prior_pjc = previous_iteration_pjc.get(state.step_index)
             if prior_pjc is None and step_input_state.pjc is not None:
@@ -1593,6 +1922,11 @@ def _diagnostic_callbacks(
             contact_force_enabled=True,
             wheel_rail_contact=wheel_rail_contact,
             missing_stages=missing_names,
+            timing=(
+                {}
+                if wheel_rail_contact is None
+                else dict(wheel_rail_contact.timing)
+            ),
         )
 
     def contact_force(
@@ -1775,6 +2109,18 @@ def _diagnostic_callbacks(
         ),
         build_stage_storage,
         extract_contact_state,
+    )
+
+
+def _network_a_enabled_for_stage(contact_geometry_mode: str, stage: SimulationStage) -> bool:
+    """Return whether a Network-A geometry model owns this stage."""
+
+    return contact_geometry_mode == "network-a" or (
+        contact_geometry_mode in {
+            "network-a-after-preload",
+            "network-a1-direct-after-preload",
+        }
+        and stage != "Preload"
     )
 
 

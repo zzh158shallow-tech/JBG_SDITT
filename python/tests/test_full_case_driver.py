@@ -24,6 +24,7 @@ from sditt.simulation import (
 )
 from sditt.simulation.full_case import (
     _matlab_mileage_step_dt,
+    _network_a_enabled_for_stage,
     _preload_cache_key,
     _run_checkpoint_key,
     _stage_step_count,
@@ -34,6 +35,17 @@ from sditt.vehicle import build_nonlinear_damper_response, wr_force_vehicle_sys_
 
 MATLAB_CLI = Path("/Applications/MATLAB_R2026a.app/bin/matlab")
 MATLAB_VALIDATION_ENV = "SDITT_RUN_MATLAB_BASELINES"
+
+
+def test_network_a_after_preload_stage_switch() -> None:
+    assert not _network_a_enabled_for_stage("traditional", "Preload")
+    assert not _network_a_enabled_for_stage("traditional", "Cal")
+    assert _network_a_enabled_for_stage("network-a", "Preload")
+    assert _network_a_enabled_for_stage("network-a", "Cal")
+    assert not _network_a_enabled_for_stage("network-a-after-preload", "Preload")
+    assert _network_a_enabled_for_stage("network-a-after-preload", "Cal")
+    assert not _network_a_enabled_for_stage("network-a1-direct-after-preload", "Preload")
+    assert _network_a_enabled_for_stage("network-a1-direct-after-preload", "Cal")
 
 
 def _matlab_validation_enabled() -> bool:
